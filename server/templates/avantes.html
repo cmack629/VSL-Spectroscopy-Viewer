@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Avantes — VSL Scan</title>
+<link rel="stylesheet" href="/static/style.css">
+<script src="/static/theme.js"></script>
+<style>
+body{display:flex;flex-direction:column;align-items:center}
+main{width:100%;max-width:1080px;padding:20px 24px 60px}
+
+#hero{display:flex;align-items:flex-end;gap:30px;margin-bottom:14px;flex-wrap:wrap}
+.ro .k{font-size:10px;text-transform:uppercase;letter-spacing:.1em;color:var(--text2)}
+.ro .v{font-family:var(--mono);color:var(--accent);line-height:1.1}
+#r-peak .v{font-size:30px;font-weight:600}
+.ro.s .v{font-size:19px;color:var(--text)}
+#satbox{margin-left:auto;text-align:right}
+#satbox .v{color:var(--green)}
+#satbox.hot .v{color:var(--red)}
+
+#plotwrap{position:relative;height:360px}
+canvas{position:absolute;inset:0;width:100%;height:100%}
+
+.setup{display:grid;grid-template-columns:repeat(12,1fr);gap:14px 16px;align-items:end}
+.span2{grid-column:span 2}.span3{grid-column:span 3}.span4{grid-column:span 4}.span12{grid-column:span 12}
+.inrow{display:flex;gap:8px}
+.actions{display:flex;gap:10px;align-items:center;margin-top:4px}
+</style>
+</head>
+<body>
+
+<header class="app-header">
+  <span class="wordmark">Avantes AvaSpec<small id="line-sub">SensLine / NIRLine</small></span>
+  <nav class="app-nav">
+    <a href="/">Scan</a>
+    <a href="/piezo">Piezo</a>
+    <a href="/stage">Stage</a>
+    <a href="/power">Power meter</a>
+    <a href="/hr4000">HR4000</a>
+    <a href="/avantes" class="active">Avantes</a>
+  </nav>
+  <div class="header-right">
+    <span class="pill"><span class="led" id="led"></span><span id="conn-txt">Connecting…</span></span>
+    <button class="theme-toggle" onclick="toggleTheme()"></button>
+  </div>
+</header>
+
+<main>
+  <div id="alert" class="alert"></div>
+
+  <!-- ── Live spectrum + readouts ──────────────────────────────── -->
+  <div class="card">
+    <div id="hero">
+      <div class="ro" id="r-peak"><div class="k">Peak</div><div class="v">—</div></div>
+      <div class="ro s" id="r-int"><div class="k">Integration</div><div class="v">—</div></div>
+      <div class="ro s" id="r-avg"><div class="k">Averaging</div><div class="v">—</div></div>
+      <div class="ro s" id="satbox"><div class="k">Saturation</div><div class="v">—</div></div>
+    </div>
+    <div id="plotwrap"><canvas id="plot"></canvas></div>
+  </div>
+
+  <!-- ── Controls ──────────────────────────────────────────────── -->
+  <div class="card">
+    <div class="setup">
+      <div class="f span3"><label>Integration time (ms)</label>
+        <div class="inrow"><input type="number" id="in-int" step="1" min="0.002" value="10">
+          <button class="btn btn-primary btn-sm" id="btn-int">Set</button></div></div>
+      <div class="f span2"><label>Averages</label>
+        <div class="inrow"><input type="number" id="in-avg" step="1" min="1" value="1">
+          <button class="btn btn-sec btn-sm" id="btn-avg">Set</button></div></div>
+      <div class="f span2"><label><span class="hint" title="On-device spectral smoothing (SmoothPix)">Smoothing (px)</span></label>
+        <div class="inrow"><input type="number" id="in-sm" step="1" min="0" value="0">
+          <button class="btn btn-sec btn-sm" id="btn-sm">Set</button></div></div>
+      <div class="f span2" style="align-self:end"><label class="chk"><input type="checkbox" id="in-dark"> <span class="hint" title="CorDynDark — dynamic dark-current correction">Dynamic dark</span></label></div>
+      <div class="f span3" style="align-self:end">
+        <div class="actions">
+          <label class="chk"><input type="checkbox" id="in-hold"> Hold y-scale</label>
+          <label class="chk"><input type="checkbox" id="in-peak" checked> Peak marker</label>
+        </div>
+      </div>
+
+      <div class="span12 actions">
+        <a class="btn btn-primary btn-sm" id="btn-save" href="/api/avantes/save">Save spectrum CSV</a>
+        <a class="btn btn-sec btn-sm" id="btn-plot" href="/api/avantes/plot"
+           title="Matplotlib figure of the current spectrum">Save plot PNG</a>
+        <button class="btn btn-sec btn-sm" id="btn-reconnect">Reconnect</button>
+        <span style="flex:1"></span>
+        <span class="muted" id="info-line"></span>
+      </div>
+    </div>
+  </div>
+</main>
+
+<script>
+const $=id=>document.getElementById(id);
+async function getJSON(u){const r=await fetch(u);return r.json();}
+async function post(u,b){const r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})});return r.json();}
+function alertMsg(m,k){const a=$('alert');a.textContent=m;a.className='alert show '+(k||'err');if(k==='ok')setTimeout(()=>a.className='alert',3000);}
+function clearAlert(){$('alert').className='alert';}
+const MONO='Menlo, Consolas, monospace', SANS='-apple-system, "Segoe UI", sans-serif';
+
+let WL=[];          // wavelengths (static, from /info)
+let YMAX_HOLD=0;
+let MAXI=65535;     // saturation level (counts)
+
+async function loadInfo(){
+  const d=await getJSON('/api/avantes/info');
+  if(!d.connected){ return; }
+  WL=d.wavelengths||[]; MAXI=d.max_counts||65535;
+  $('in-int').value=d.integration_time_ms; $('in-avg').value=d.n_averaged;
+  $('in-sm').value=d.smooth_pix; $('in-dark').checked=!!d.dark;
+  $('line-sub').textContent=d.line+' · '+d.detector;
+  $('info-line').textContent=`${d.name||d.line} · S/N ${d.serial} · ${d.pixels} px · ${d.wl_min}–${d.wl_max} nm · FW ${d.firmware||'?'}`;
+}
+
+async function act(p,b,ok){ clearAlert(); const r=await post(p,b); if(r.error){alertMsg(r.error);return;} if(ok)alertMsg(ok,'ok'); }
+$('btn-int').onclick=()=>act('/api/avantes/integration',{ms:+$('in-int').value},'Integration time set');
+$('btn-avg').onclick=()=>act('/api/avantes/averaging',{scans:+$('in-avg').value},'Averaging set');
+$('btn-sm').onclick =()=>act('/api/avantes/smoothing',{pixels:+$('in-sm').value},'Smoothing set');
+$('in-dark').onchange=()=>act('/api/avantes/dark',{enable:$('in-dark').checked});
+$('in-hold').onchange=()=>{ YMAX_HOLD=0; };
+$('btn-reconnect').onclick=async()=>{ const r=await post('/api/avantes/reconnect'); loadInfo(); alertMsg(r.connected?'Reconnected.':(r.error||'Failed'),r.connected?'ok':'err'); };
+
+let Y=[];
+async function poll(){
+  let d; try{ d=await getJSON('/api/avantes/spectrum'); }catch(e){ return; }
+  const ok=!!d.connected;
+  $('led').className='led '+(ok?(d.saturated?'orange':'green'):'red');
+  $('conn-txt').textContent=ok?(d.saturated?'Connected · SATURATED':'Connected'):(d.error||'Disconnected');
+  if(!ok){ $('info-line').textContent=(d.error||'').split(String.fromCharCode(10))[0]; return; }
+  Y=d.intensities||[];
+  $('r-peak').querySelector('.v').textContent=(d.peak_intensity!=null)
+    ? `${Math.round(d.peak_intensity)} @ ${(+d.peak_wavelength).toFixed(2)} nm` : '—';
+  $('r-int').querySelector('.v').textContent=(+d.integration_time_ms).toFixed(2)+' ms';
+  $('r-avg').querySelector('.v').textContent=(d.n_averaged||1)+'×'+(d.smooth_pix?(' · sm '+d.smooth_pix):'');
+  const frac=d.max_counts? Math.round(100*(d.peak_intensity||0)/d.max_counts):0;
+  $('satbox').querySelector('.v').textContent=frac+' %';
+  $('satbox').className='ro s'+(frac>=99?' hot':'');
+  drawPlot();
+}
+
+// ── plot ──────────────────────────────────────────────────────────
+const cv=$('plot'), ctx=cv.getContext('2d');
+function sizeCanvas(){const d=window.devicePixelRatio||1,w=cv.clientWidth,h=cv.clientHeight;
+  cv.width=w*d;cv.height=h*d;ctx.setTransform(d,0,0,d,0,0);return[w,h];}
+function niceStep(r,t){const raw=r/t,mag=Math.pow(10,Math.floor(Math.log10(raw))),n=raw/mag,m=n<1.5?1:n<3?2:n<7?5:10;return m*mag;}
+function drawPlot(){
+  const [W,H]=sizeCanvas(); ctx.clearRect(0,0,W,H);
+  const C={frame:cssVar('--plot-frame'),grid:cssVar('--plot-grid'),tick:cssVar('--plot-tick'),
+    label:cssVar('--plot-label'),line:cssVar('--plot-line'),green:cssVar('--green'),
+    red:cssVar('--red'),text3:cssVar('--text3')};
+  const padL=64,padR=16,padT=14,padB=40, x0=padL,x1=W-padR,y0=H-padB,y1=padT;
+  ctx.strokeStyle=C.frame; ctx.lineWidth=1; ctx.strokeRect(x0,y1,x1-x0,y0-y1);
+  if(!Y.length || WL.length!==Y.length){ ctx.fillStyle=C.text3; ctx.font='13px '+SANS; ctx.textAlign='center';
+    ctx.fillText('Waiting for spectrum…',(x0+x1)/2,(y0+y1)/2); return; }
+  const xmin=WL[0], xmax=WL[WL.length-1];
+  let ymax=0; for(const v of Y) if(v>ymax) ymax=v;
+  if($('in-hold').checked){ YMAX_HOLD=Math.max(YMAX_HOLD,ymax); ymax=YMAX_HOLD; }
+  ymax=Math.max(ymax*1.05, 10);
+  const xR=xmax-xmin||1, sx=v=>x0+(v-xmin)/xR*(x1-x0), sy=v=>y0-(v/ymax)*(y0-y1);
+  ctx.font='11px '+MONO;
+  ctx.textAlign='center'; ctx.textBaseline='top'; const xs=niceStep(xR,8);
+  for(let v=Math.ceil(xmin/xs)*xs; v<=xmax; v+=xs){
+    ctx.strokeStyle=C.grid; ctx.beginPath(); ctx.moveTo(sx(v),y1); ctx.lineTo(sx(v),y0); ctx.stroke();
+    ctx.fillStyle=C.tick; ctx.fillText(v.toFixed(0),sx(v),y0+6); }
+  ctx.textAlign='right'; ctx.textBaseline='middle'; const ys=niceStep(ymax,5);
+  for(let v=0; v<=ymax; v+=ys){
+    ctx.strokeStyle=C.grid; ctx.beginPath(); ctx.moveTo(x0,sy(v)); ctx.lineTo(x1,sy(v)); ctx.stroke();
+    ctx.fillStyle=C.tick; ctx.fillText(v>=1000?(v/1000).toFixed(0)+'k':v.toFixed(0),x0-6,sy(v)); }
+  if(MAXI<=ymax){ ctx.strokeStyle=C.red; ctx.setLineDash([3,3]); ctx.beginPath();
+    ctx.moveTo(x0,sy(MAXI)); ctx.lineTo(x1,sy(MAXI)); ctx.stroke(); ctx.setLineDash([]); }
+  ctx.fillStyle=C.label; ctx.font='11px '+SANS; ctx.textAlign='center'; ctx.textBaseline='bottom';
+  ctx.fillText('Wavelength (nm)',(x0+x1)/2,H-4);
+  ctx.save(); ctx.translate(14,(y0+y1)/2); ctx.rotate(-Math.PI/2); ctx.textBaseline='top';
+  ctx.fillText('Intensity (counts)',0,0); ctx.restore();
+  ctx.strokeStyle=C.line; ctx.lineWidth=1.2; ctx.beginPath();
+  for(let i=0;i<Y.length;i++){ const X=sx(WL[i]),Yy=sy(Y[i]); i?ctx.lineTo(X,Yy):ctx.moveTo(X,Yy); }
+  ctx.stroke();
+  if($('in-peak').checked){
+    let pi=0; for(let i=1;i<Y.length;i++) if(Y[i]>Y[pi]) pi=i;
+    ctx.strokeStyle=C.green; ctx.setLineDash([4,3]); ctx.beginPath();
+    ctx.moveTo(sx(WL[pi]),y0); ctx.lineTo(sx(WL[pi]),y1); ctx.stroke(); ctx.setLineDash([]);
+    ctx.fillStyle=C.green; ctx.textAlign='center'; ctx.textBaseline='bottom';
+    ctx.fillText(WL[pi].toFixed(1)+' nm', sx(WL[pi]), sy(Y[pi])-4);
+  }
+}
+window.addEventListener('resize',drawPlot);
+window.addEventListener('themechange',drawPlot);
+
+loadInfo(); poll();
+setInterval(poll, 250);
+setInterval(()=>{ if(!WL.length) loadInfo(); }, 3000);
+</script>
+</body>
+</html>

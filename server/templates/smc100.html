@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Stage — VSL Scan</title>
+<link rel="stylesheet" href="/static/style.css">
+<script src="/static/theme.js"></script>
+<style>
+body{display:flex;flex-direction:column;align-items:center}
+main{width:100%;max-width:920px;padding:20px 24px 60px}
+
+#statebadge{font-size:11px;font-weight:700;letter-spacing:.06em;padding:4px 12px;border-radius:20px;
+  border:1px solid var(--border2);color:var(--text2);text-transform:uppercase}
+#statebadge.ready{color:#fff;background:var(--green);border-color:var(--green)}
+#statebadge.move{color:#fff;background:var(--accent);border-color:var(--accent)}
+#statebadge.warn{color:#fff;background:var(--orange);border-color:var(--orange)}
+#statebadge.off{color:#fff;background:var(--red);border-color:var(--red)}
+
+/* readout */
+#readout{display:flex;align-items:flex-end;gap:34px;flex-wrap:wrap;margin-bottom:16px}
+.ro .k{font-size:10px;text-transform:uppercase;letter-spacing:.1em;color:var(--text2)}
+.ro .v{font-family:var(--mono);color:var(--accent);line-height:1.1}
+#ro-pos .v{font-size:40px;font-weight:600}
+.ro.s .v{font-size:20px;color:var(--text)}
+#ro-vel .v{color:var(--text)}
+
+/* travel bar */
+#barwrap{position:relative;height:28px;background:var(--display-bg);border:1px solid var(--display-brd);
+  border-radius:6px;overflow:hidden;margin-bottom:4px}
+#bar-fill{position:absolute;top:0;left:0;height:100%;width:0%;
+  background:var(--primary);opacity:.75;transition:width .15s}
+#bar-tgt{position:absolute;top:-2px;height:32px;width:2px;background:var(--yellow);transition:left .15s}
+.barlbl{display:flex;justify-content:space-between;font-size:10px;color:var(--text3);font-family:var(--mono)}
+
+/* controls grid */
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+.f{margin-bottom:12px}
+.inrow{display:flex;gap:8px}
+.btn-jog{font-size:16px;padding:7px 16px;font-family:var(--mono)}
+.btn-wide{width:100%}
+.row{display:flex;gap:10px;align-items:center}
+
+/* info table */
+.info{display:grid;grid-template-columns:auto 1fr;gap:6px 18px;font-size:12px}
+.info dt{color:var(--text2)}
+.info dd{font-family:var(--mono);text-align:right}
+#lasterr{color:var(--orange)}
+</style>
+</head>
+<body>
+
+<header class="app-header">
+  <span class="wordmark">Newport SMC100CC<small>LTA-HS actuator</small></span>
+  <nav class="app-nav">
+    <a href="/">Scan</a>
+    <a href="/piezo">Piezo</a>
+    <a href="/stage" class="active">Stage</a>
+    <a href="/power">Power meter</a>
+    <a href="/hr4000">HR4000</a>
+    <a href="/avantes">Avantes</a>
+  </nav>
+  <div class="header-right">
+    <span id="statebadge">—</span>
+    <span class="pill"><span class="led" id="led"></span><span id="conn-txt">Connecting…</span></span>
+    <button class="theme-toggle" onclick="toggleTheme()"></button>
+  </div>
+</header>
+
+<main>
+  <div id="alert" class="alert"></div>
+
+  <!-- ── Position + travel bar ─────────────────────────────────── -->
+  <div class="card">
+    <div id="readout">
+      <div class="ro" id="ro-pos"><div class="k">Position</div><div class="v">—</div></div>
+      <div class="ro s" id="ro-tgt"><div class="k">Target</div><div class="v">—</div></div>
+      <div class="ro s" id="ro-vel"><div class="k">Velocity</div><div class="v">—</div></div>
+    </div>
+    <div id="barwrap"><div id="bar-fill"></div><div id="bar-tgt"></div></div>
+    <div class="barlbl"><span id="lim-lo">0 mm</span><span id="lim-hi">50 mm</span></div>
+  </div>
+
+  <!-- ── Controls ──────────────────────────────────────────────── -->
+  <div class="card">
+    <div class="h">Motion control</div>
+
+    <div class="row" style="margin-bottom:16px">
+      <button class="btn btn-primary" id="btn-home">Home (reference)</button>
+      <button class="btn btn-sec" id="btn-enable">Enable</button>
+      <span style="flex:1"></span>
+      <button class="btn btn-stop solid btn-lg" id="btn-stop">STOP</button>
+    </div>
+
+    <div class="grid">
+      <!-- absolute -->
+      <div class="f">
+        <label>Move to absolute position (mm)</label>
+        <div class="inrow">
+          <input type="number" id="in-abs" step="0.001" value="0">
+          <button class="btn btn-go" id="btn-abs">Go</button>
+        </div>
+      </div>
+      <!-- velocity -->
+      <div class="f">
+        <label>Velocity (mm/s) <span class="muted" id="vmax"></span></label>
+        <div class="inrow">
+          <input type="number" id="in-vel" step="0.1" min="0" value="2">
+          <button class="btn btn-sec" id="btn-vel">Set</button>
+        </div>
+      </div>
+      <!-- jog -->
+      <div class="f">
+        <label>Jog step (mm)</label>
+        <div class="inrow">
+          <button class="btn btn-sec btn-jog" id="btn-jog-neg">◀</button>
+          <input type="number" id="in-jog" step="0.001" value="0.1" style="text-align:center">
+          <button class="btn btn-sec btn-jog" id="btn-jog-pos">▶</button>
+        </div>
+      </div>
+      <!-- reset -->
+      <div class="f">
+        <label>Controller</label>
+        <div class="inrow">
+          <button class="btn btn-sec btn-wide" id="btn-reset">Reset (RS)</button>
+          <button class="btn btn-sec btn-wide" id="btn-reconnect">Reconnect</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Profile / info ────────────────────────────────────────── -->
+  <details class="card">
+    <summary><span class="h">Actuator profile &amp; controller</span></summary>
+    <dl class="info" id="info" style="margin-top:12px"></dl>
+  </details>
+</main>
+
+<script>
+const $=id=>document.getElementById(id);
+async function getJSON(u){const r=await fetch(u);return r.json();}
+async function post(u,b){const r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})});return r.json();}
+function alertMsg(m,k){const a=$('alert');a.textContent=m;a.className='alert show '+(k||'err');if(k==='ok')setTimeout(()=>a.className='alert',3000);}
+function clearAlert(){$('alert').className='alert';}
+
+const STATE_CLASS={'READY':'ready','MOVING':'move','HOMING':'move','JOGGING':'move',
+  'NOT REFERENCED':'warn','CONFIGURATION':'warn','DISABLE':'off','UNKNOWN':'off'};
+
+let REFERENCED=false, MOVING=false, ENABLED=true, LIMS={min:0,max:50};
+
+// ── INFO (once) ───────────────────────────────────────────────────
+async function loadInfo(){
+  const d=await getJSON('/api/smc/info');
+  const p=d.profile||{};
+  $('vmax').textContent = p.max_velocity_mm_s?('max '+p.max_velocity_mm_s+' mm/s'):'';
+  $('in-vel').max = p.max_velocity_mm_s||5;
+  if(p.travel_mm){ $('in-abs').max=p.travel_mm; $('in-abs').min=0; }
+  const rows=[
+    ['Actuator', p.name],
+    ['Controller', p.controller],
+    ['Motor', p.motor_type],
+    ['Travel', p.travel_mm!=null?p.travel_mm+' mm':'—'],
+    ['Min. incremental motion', p.min_incremental_motion_um!=null?p.min_incremental_motion_um+' µm':'—'],
+    ['Max speed', p.max_velocity_mm_s!=null?p.max_velocity_mm_s+' mm/s':'—'],
+    ['Encoder', p.encoder_counts_per_rev?p.encoder_counts_per_rev+' cnt/rev':'—'],
+  ];
+  if(d.connected){
+    rows.push(['—','—']);
+    rows.push(['Port', d.port]); rows.push(['Address', d.address]);
+    rows.push(['Firmware', d.firmware||'—']);
+    rows.push(['Stage ID', d.stage_id||'(not ESP-coded)']);
+    if(d.limits_mm) rows.push(['Soft limits', d.limits_mm.min+' … '+d.limits_mm.max+' mm']);
+  }
+  rows.push(['Last error', '<span id="lasterr">—</span>']);
+  $('info').innerHTML=rows.map(([k,v])=> k==='—'
+    ? '<dt class="muted">·</dt><dd class="muted">·</dd>'
+    : `<dt>${k}</dt><dd>${v}</dd>`).join('');
+}
+
+// ── STATUS poll ───────────────────────────────────────────────────
+async function poll(){
+  let s; try{ s=await getJSON('/api/smc/status'); }catch(e){ return; }
+  const ok=!!s.connected;
+  $('led').className='led '+(ok?'green':'red');
+  $('conn-txt').textContent=ok?'Connected':(s.error||'Disconnected');
+  const badge=$('statebadge');
+  badge.textContent=s.state||'—';
+  badge.className=STATE_CLASS[s.state]||'off';
+  if(!ok) return;
+
+  REFERENCED=!!s.referenced; MOVING=!!s.moving;
+  ENABLED = s.state!=='DISABLE';
+  LIMS=s.limits||LIMS;
+
+  $('ro-pos').querySelector('.v').textContent=(+s.position).toFixed(4)+' mm';
+  $('ro-tgt').querySelector('.v').textContent=(+s.target).toFixed(4)+' mm';
+  $('ro-vel').querySelector('.v').textContent=(+s.velocity).toFixed(3)+' mm/s';
+  $('lim-lo').textContent=LIMS.min+' mm'; $('lim-hi').textContent=LIMS.max+' mm';
+  const pct=Math.round((s.fraction||0)*1000)/10;
+  $('bar-fill').style.width=pct+'%';
+  $('bar-tgt').style.left = (LIMS.max>LIMS.min ? ((s.target-LIMS.min)/(LIMS.max-LIMS.min)*100):0)+'%';
+
+  // enable/disable button label + gating
+  $('btn-enable').textContent = ENABLED?'Disable':'Enable';
+  const lock = MOVING;
+  ['btn-abs','btn-jog-neg','btn-jog-pos'].forEach(id=>$(id).disabled=lock||!REFERENCED);
+  $('btn-home').disabled=lock;
+  // home button hint when not referenced
+  $('btn-home').classList.toggle('btn-go', !REFERENCED);
+  $('btn-home').classList.toggle('btn-primary', REFERENCED);
+}
+
+// ── actions ───────────────────────────────────────────────────────
+async function act(p,b){ clearAlert(); const r=await post(p,b); if(r.error){alertMsg(r.error);return null;} return r; }
+
+$('btn-home').onclick =()=>act('/api/smc/home').then(r=>r&&alertMsg(r.message||'Homing…','ok'));
+$('btn-stop').onclick =()=>post('/api/smc/stop');
+function moveFb(r){ if(!r) return;
+  if(r.warning){ alertMsg(r.warning, 'err'); return; }
+  const note = r.te==='?' ? ' (no TE reply)' : '';
+  alertMsg((r.moving?'Moving…':'Command sent')+' — state '+r.state+note, 'ok'); }
+$('btn-abs').onclick  =()=>act('/api/smc/move',{position:+$('in-abs').value}).then(moveFb);
+$('btn-jog-neg').onclick=()=>act('/api/smc/move/relative',{delta:-Math.abs(+$('in-jog').value)}).then(moveFb);
+$('btn-jog-pos').onclick=()=>act('/api/smc/move/relative',{delta:+Math.abs(+$('in-jog').value)}).then(moveFb);
+$('btn-vel').onclick  =()=>act('/api/smc/velocity',{velocity:+$('in-vel').value}).then(r=>r&&alertMsg('Velocity set to '+r.velocity+' mm/s','ok'));
+$('btn-enable').onclick=()=>act('/api/smc/enable',{enable:!ENABLED});
+$('btn-reset').onclick =()=>{ if(confirm('Reset the controller? You will need to re-home.')) act('/api/smc/reset').then(r=>r&&alertMsg(r.message,'ok')); };
+$('btn-reconnect').onclick=async()=>{ const r=await post('/api/smc/reconnect'); loadInfo(); alertMsg(r.connected?'Reconnected.':(r.error||'Failed'),r.connected?'ok':'err'); };
+
+// ── boot ──────────────────────────────────────────────────────────
+loadInfo(); poll();
+setInterval(poll, 250);
+</script>
+</body>
+</html>

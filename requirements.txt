@@ -1,0 +1,41 @@
+# VSL knife-edge scan app
+#
+# Hardware backends are imported defensively (server/detectors.py,
+# server/actuators.py, drivers/*.py) — a missing optional package or native
+# library degrades that one instrument to "not connected" instead of
+# crashing the app, so this list can be installed as-is even on a machine
+# with only some of the instruments attached.
+
+Flask>=3.0,<4
+
+# BPC301 piezo controller (drivers/controller.py) — plain serial, with a
+# pyftdi/libusb fallback for FTDI chips without a VCP driver installed.
+pyserial>=3.5,<4
+pyftdi>=0.57,<1
+pyusb>=1.2,<2
+
+# PM400 power meter (drivers/pm400.py) — pure-Python VISA-over-USB backend,
+# no NI-VISA / Thorlabs TLPM.dll required.
+pyvisa>=1.14,<2
+pyvisa-py>=0.7,<1
+
+# HR4000 spectrometer (drivers/hr4000.py) — pulls in numpy. On Linux, PyPI
+# has no prebuilt wheel for seabreeze's compiled cseabreeze backend, so pip
+# tries to build it from source unless told not to; drivers/hr4000.py forces
+# the pure-Python pyseabreeze (pyusb) backend at runtime regardless, so
+# setup.sh installs this one separately with --without-cseabreeze on Linux
+# to skip that build entirely. macOS/Windows have prebuilt wheels — nothing
+# special needed there. See setup.sh / setup.ps1.
+seabreeze>=2.0,<3
+
+# Matplotlib plot/figure export (server/plots.py) — Agg backend, headless.
+matplotlib>=3.8,<4
+
+# Avantes AvaSpec spectrometer (drivers/avantes.py) is a ctypes wrapper over
+# the vendor's libavs shared library — there is no pip package for it. Only
+# a macOS arm64 libavs.dylib is vendored in drivers/libavs/. On another OS,
+# grab the matching Avantes SDK file for that machine (Linux: libavs.so;
+# Windows: avaspec_production.dll, or extract one from the installer) and
+# place it in drivers/libavs/ — no code or requirements changes needed, the
+# loader in drivers/avantes.py already checks per-platform filenames there.
+# Only needed on a machine that actually has an Avantes spectrometer attached.

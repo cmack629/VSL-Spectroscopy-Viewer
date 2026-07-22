@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+.DS_Store
+.pytest_cache/
+.claude/
+
+# drivers/libavs/*.dylib (Avantes SDK, macOS) is intentionally NOT ignored —
+# it's vendored and committed so macOS coworkers get a working Avantes
+# detector straight out of a clone. If you add a Linux/Windows SDK file
+# there too (see requirements.txt), commit it the same way.

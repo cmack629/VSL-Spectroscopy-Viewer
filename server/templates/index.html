@@ -1,0 +1,808 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Piezo — VSL Scan</title>
+<link rel="stylesheet" href="/static/style.css">
+<script src="/static/theme.js"></script>
+<style>
+#app { display: flex; flex-direction: column; height: 100%; min-height: 100vh; }
+
+#alert { display: none; padding: 7px 14px; font-size: 12px;
+  background: rgba(217,95,95,.10); color: var(--red); border-bottom: 1px solid var(--red); }
+#alert.show { display: block; }
+
+#main { display: grid; grid-template-columns: 240px 1fr; flex: 1; overflow: hidden; }
+#sidebar { background: var(--surface); border-right: 1px solid var(--border);
+  display: flex; flex-direction: column; overflow-y: auto; }
+.sidebar-block { padding: 14px 16px; border-bottom: 1px solid var(--border); }
+#content { display: flex; flex-direction: column; overflow-y: auto; }
+.content-row { display: grid; grid-template-columns: 1fr 1fr; gap: 1px;
+  background: var(--border); flex-shrink: 0; }
+
+#chart-section { background: var(--surface); border-top: 1px solid var(--border);
+  padding: 14px 18px 10px; flex-shrink: 0; }
+#chart { width: 100%; height: 120px; display: block; }
+
+/* Voltage / position bars */
+.volt-track { height: 6px; background: var(--display-bg); border-radius: 3px;
+  border: 1px solid var(--display-brd); overflow: hidden; }
+.volt-fill { height: 100%; width: 0%; background: var(--accent);
+  border-radius: 3px; transition: width .15s ease; }
+.volt-labels { display: flex; justify-content: space-between;
+  font-size: 10px; color: var(--text3); margin-top: 3px; }
+#voltage-bar-wrap { margin: 12px 0 4px; position: relative; }
+
+.status-row { display: flex; align-items: center; gap: 8px; padding: 5px 0; font-size: 12px; }
+.status-row .led { flex-shrink: 0; }
+
+.presets { display: flex; gap: 4px; margin-top: 8px; flex-wrap: wrap; }
+.preset-btn { flex: 1; min-width: 42px; }
+
+.jog-row { display: flex; gap: 4px; align-items: center; }
+.jog-row .btn { flex: 1; font-size: 11px; padding: 5px 4px; font-weight: 600; }
+
+#sweep-indicator { display: none; align-items: center; gap: 8px; padding: 6px 10px;
+  background: var(--focus-ring); border: 1px solid var(--accent); border-radius: var(--radius);
+  font-size: 11px; color: var(--accent); margin-top: 10px; }
+#sweep-indicator.active { display: flex; }
+
+.notice { margin-top: 12px; padding: 10px; border-radius: 6px;
+  border: 1px solid var(--orange); background: rgba(217,154,78,.08); }
+</style>
+</head>
+<body>
+<div id="app">
+
+  <!-- Alert bar -->
+  <div id="alert"></div>
+
+  <!-- Header -->
+  <header class="app-header">
+    <span class="wordmark">Thorlabs <span id="hdr-model">BPC301</span><small>piezo controller</small></span>
+    <nav class="app-nav">
+      <a href="/">Scan</a>
+      <a href="/piezo" class="active">Piezo</a>
+      <a href="/stage">Stage</a>
+      <a href="/power">Power meter</a>
+      <a href="/hr4000">HR4000</a>
+      <a href="/avantes">Avantes</a>
+    </nav>
+    <div class="header-right">
+      <span class="badge" id="hdr-sn">—</span>
+      <span class="badge" id="hdr-fw">—</span>
+      <span class="badge" id="hdr-port" style="max-width:220px;overflow:hidden;text-overflow:ellipsis;">—</span>
+      <span class="pill" id="conn-indicator">
+        <span class="led" id="conn-led"></span>
+        <span id="conn-text">Connecting…</span>
+      </span>
+      <button class="theme-toggle" onclick="toggleTheme()"></button>
+    </div>
+  </header>
+
+  <!-- Main layout -->
+  <div id="main">
+
+    <!-- Left sidebar -->
+    <div id="sidebar">
+
+      <!-- Output voltage display -->
+      <div class="sidebar-block">
+        <div class="display-label">Output Voltage</div>
+        <div class="display-box" id="disp-set">
+          <span id="set-v-disp">—</span><span class="display-unit">V</span>
+        </div>
+        <div style="margin-top:8px">
+          <div class="display-label">Readback</div>
+          <div class="display-box display-sm" id="disp-read" style="font-size:22px">
+            <span id="read-v-disp">—</span><span class="display-unit" style="font-size:13px">V</span>
+          </div>
+        </div>
+        <div id="voltage-bar-wrap">
+          <div class="volt-track"><div class="volt-fill" id="volt-fill"></div></div>
+          <div class="volt-labels">
+            <span>0 V</span><span id="bar-max">75 V</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Position display (closed loop) -->
+      <div class="sidebar-block">
+        <div class="display-label">Position</div>
+        <div class="display-box display-sm" id="disp-pos" style="font-size:26px">
+          <span id="pos-disp">—</span><span class="display-unit" style="font-size:14px">µm</span>
+        </div>
+        <div id="position-bar-wrap" style="margin:12px 0 4px;position:relative">
+          <div class="volt-track"><div class="volt-fill" id="pos-fill"></div></div>
+          <div class="volt-labels">
+            <span>0 µm</span><span id="pos-bar-max">30 µm</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Status LEDs -->
+      <div class="sidebar-block">
+        <h3>Status</h3>
+        <div class="status-row">
+          <span class="led" id="led-piezo"></span>
+          <span id="lbl-piezo">Piezo Not Detected</span>
+        </div>
+        <div class="status-row">
+          <span class="led" id="led-sg"></span>
+          <span id="lbl-sg">Strain Gauge: Not Connected</span>
+        </div>
+        <div class="status-row">
+          <span class="led" id="led-loop"></span>
+          <span id="lbl-loop">Open Loop</span>
+        </div>
+        <div class="status-row">
+          <span class="led" id="led-zero"></span>
+          <span id="lbl-zero">Not Zero'd</span>
+        </div>
+      </div>
+
+      <!-- Action buttons -->
+      <div class="sidebar-block" style="display:flex;flex-direction:column;gap:7px">
+        <h3>Controls</h3>
+        <button class="btn btn-primary btn-full" onclick="cmdIdentify()">
+          Identify (flash LED)
+        </button>
+        <button class="btn btn-full" id="btn-output" onclick="toggleOutput()">
+          Enable Output
+        </button>
+        <button class="btn btn-full" onclick="setVoltage(0)">
+          Zero Voltage
+        </button>
+        <div class="divider"></div>
+        <button class="btn btn-sm btn-full" style="color:var(--text3)"
+                onclick="cmdReconnect()">Reconnect</button>
+      </div>
+
+    </div><!-- /sidebar -->
+
+    <!-- Right content -->
+    <div id="content">
+
+      <div class="content-row">
+
+        <!-- Voltage control -->
+        <div class="panel" id="voltage-panel">
+          <h3>Voltage Control</h3>
+
+          <div style="margin-bottom:12px">
+            <div style="display:flex;justify-content:space-between;
+                        font-size:11px;color:var(--text2);margin-bottom:5px">
+              <span>0 V</span>
+              <span id="slider-live" style="color:var(--accent);font-weight:600">0.00 V</span>
+              <span id="slider-max-lbl">75 V</span>
+            </div>
+            <input type="range" id="volt-slider" min="0" max="75" step="0.1" value="0"
+                   oninput="onSliderInput(this.value)"
+                   onchange="onSliderCommit(this.value)">
+          </div>
+
+          <div class="form-row">
+            <div class="form-col">
+              <div class="form-label">Set Voltage</div>
+              <div class="input-row">
+                <input type="number" id="volt-input" min="0" max="75"
+                       step="0.1" value="0.0"
+                       onkeydown="if(event.key==='Enter') applyVoltageInput()">
+                <span class="input-unit">V</span>
+              </div>
+            </div>
+            <button class="btn btn-primary" onclick="applyVoltageInput()"
+                    style="margin-bottom:0;align-self:flex-end">Apply</button>
+          </div>
+
+          <div class="presets">
+            <button class="btn btn-sm preset-btn" onclick="setPercent(0)">0%</button>
+            <button class="btn btn-sm preset-btn" onclick="setPercent(25)">25%</button>
+            <button class="btn btn-sm preset-btn" onclick="setPercent(50)">50%</button>
+            <button class="btn btn-sm preset-btn" onclick="setPercent(75)">75%</button>
+            <button class="btn btn-sm preset-btn btn-accent" onclick="setPercent(100)">100%</button>
+          </div>
+        </div>
+
+        <!-- Jog -->
+        <div class="panel" id="jog-panel">
+          <h3>Jog</h3>
+
+          <div class="form-row" style="margin-bottom:10px">
+            <div class="form-col">
+              <div class="form-label">Step Size</div>
+              <div class="input-row">
+                <input type="number" id="jog-step" min="0.01" max="75"
+                       step="0.01" value="1.0" style="max-width:90px">
+                <span class="input-unit">V</span>
+              </div>
+            </div>
+            <div class="form-col" style="flex:0">
+              <div class="form-label">Quick</div>
+              <div style="display:flex;gap:4px">
+                <button class="btn btn-sm" onclick="setJogStep(0.1)">0.1</button>
+                <button class="btn btn-sm" onclick="setJogStep(1)">1</button>
+                <button class="btn btn-sm" onclick="setJogStep(5)">5</button>
+                <button class="btn btn-sm" onclick="setJogStep(10)">10</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="jog-row">
+            <button class="btn" onclick="jogTo(0)" title="Go to 0 V">|◀</button>
+            <button class="btn" onclick="jog(-10)">−10 V</button>
+            <button class="btn" onclick="jogByStep(-1)">−Step</button>
+            <button class="btn" onclick="jogByStep(+1)">+Step</button>
+            <button class="btn" onclick="jog(+10)">+10 V</button>
+            <button class="btn" onclick="jogTo(maxVoltage)" title="Go to max V">▶|</button>
+          </div>
+        </div>
+
+      </div><!-- /content-row -->
+
+      <!-- Closed-loop position control -->
+      <div class="panel" style="border-top:1px solid var(--border)">
+        <h3>Position Control · Closed Loop</h3>
+
+        <!-- Not zeroed: show the zero workflow -->
+        <div id="cl-setup">
+          <button class="btn btn-accent" id="btn-zero-start" onclick="startZero()"
+                  title="Zeroes the strain gauge, then engages closed-loop position control">
+            Zero &amp; Enable Closed Loop
+          </button>
+
+          <div id="cl-zeroing" class="notice" style="display:none">
+            <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
+              <span class="led orange"></span>
+              <span style="color:var(--orange);font-weight:600">Zeroing in progress…</span>
+            </div>
+            <p style="font-size:12px;margin-bottom:10px">
+              Watch the BPC301 front panel: the <b>Zeroed</b> LED flashes while
+              zeroing (~15–20 s), then stays <b>solid</b>.
+            </p>
+            <button class="btn btn-success" id="btn-zero-confirm" onclick="confirmZeroed()">
+              ✓ Zeroed LED is Solid — Confirm
+            </button>
+            <button class="btn btn-sm" style="margin-left:6px" onclick="cancelZero()">Cancel</button>
+          </div>
+        </div>
+
+        <!-- Zeroed + closed loop: show move controls -->
+        <div id="cl-controls" style="display:none">
+          <div style="margin-bottom:12px">
+            <div style="display:flex;justify-content:space-between;
+                        font-size:11px;color:var(--text2);margin-bottom:5px">
+              <span>0 µm</span>
+              <span id="pos-slider-live" style="color:var(--accent);font-weight:600">0.00 µm</span>
+              <span id="pos-slider-max">30 µm</span>
+            </div>
+            <input type="range" id="pos-slider" min="0" max="30" step="0.05" value="0"
+                   oninput="onPosSliderInput(this.value)"
+                   onchange="onPosSliderCommit(this.value)">
+          </div>
+
+          <div class="form-row">
+            <div class="form-col">
+              <div class="form-label">Target Position</div>
+              <div class="input-row">
+                <input type="number" id="pos-input" min="0" max="30" step="0.05" value="0.0"
+                       onkeydown="if(event.key==='Enter') applyPosInput()">
+                <span class="input-unit">µm</span>
+              </div>
+            </div>
+            <button class="btn btn-primary" id="btn-move" onclick="applyPosInput()"
+                    style="margin-bottom:0;align-self:flex-end">Move</button>
+          </div>
+
+          <div class="presets">
+            <button class="btn btn-sm preset-btn" onclick="movePercent(0)">0%</button>
+            <button class="btn btn-sm preset-btn" onclick="movePercent(25)">25%</button>
+            <button class="btn btn-sm preset-btn" onclick="movePercent(50)">50%</button>
+            <button class="btn btn-sm preset-btn" onclick="movePercent(75)">75%</button>
+            <button class="btn btn-sm preset-btn btn-accent" onclick="movePercent(100)">100%</button>
+          </div>
+
+          <div id="cl-moving" style="display:none;align-items:center;gap:8px;padding:6px 10px;
+               background:var(--focus-ring);border:1px solid var(--accent);border-radius:6px;
+               font-size:11px;color:var(--accent);margin-top:10px">
+            <span class="led orange"></span> Moving…
+          </div>
+
+          <div class="divider"></div>
+          <button class="btn btn-sm" onclick="returnOpenLoop()">Return to Open-Loop Voltage</button>
+        </div>
+      </div>
+
+      <!-- Sweep -->
+      <div class="panel" id="sweep-panel" style="border-top:1px solid var(--border)">
+        <h3>Voltage Sweep</h3>
+        <div class="form-row">
+          <div class="form-col">
+            <div class="form-label">Start</div>
+            <div class="input-row">
+              <input type="number" id="sw-start" value="0" min="0" max="75" step="0.1">
+              <span class="input-unit">V</span>
+            </div>
+          </div>
+          <div class="form-col">
+            <div class="form-label">Stop</div>
+            <div class="input-row">
+              <input type="number" id="sw-stop" value="75" min="0" max="75" step="0.1">
+              <span class="input-unit">V</span>
+            </div>
+          </div>
+          <div class="form-col">
+            <div class="form-label">Steps</div>
+            <input type="number" id="sw-steps" value="50" min="2" max="1000" step="1">
+          </div>
+          <div class="form-col">
+            <div class="form-label">Dwell (s)</div>
+            <input type="number" id="sw-dwell" value="0.1" min="0.01" max="10" step="0.01">
+          </div>
+        </div>
+        <div style="display:flex;align-items:center;gap:10px">
+          <label class="chk">
+            <input type="checkbox" id="sw-repeat" style="width:auto">
+            Repeat
+          </label>
+          <button class="btn btn-success" id="btn-sweep-start" onclick="startSweep()">Run Sweep</button>
+          <button class="btn btn-danger"  id="btn-sweep-stop"  onclick="stopSweep()" disabled>Stop</button>
+        </div>
+        <div id="sweep-indicator">
+          <span class="led green"></span>
+          Sweep running…
+        </div>
+      </div>
+
+      <!-- Chart -->
+      <div id="chart-section">
+        <h3 style="margin-bottom:6px">Voltage History (last 90 s)</h3>
+        <canvas id="chart"></canvas>
+      </div>
+
+    </div><!-- /content -->
+  </div><!-- /main -->
+</div><!-- /app -->
+
+<script>
+// ── State ─────────────────────────────────────────────────────────────────
+let maxVoltage   = 75.0;
+let currentSetV  = 0.0;
+let outputEnabled = false;
+let pollTimer    = null;
+
+// Closed-loop state
+let maxTravel    = 30.0;
+let closedLoop   = false;
+let busyState    = null;   // null | 'zeroing' | 'moving'
+
+// Chart history: [{t: timestamp_ms, v: voltage}]
+const CHART_DURATION = 90_000; // ms
+let history = [];
+
+// ── Init ──────────────────────────────────────────────────────────────────
+window.addEventListener('DOMContentLoaded', () => {
+  fetchInfo();
+  startPolling();
+  window.addEventListener('resize', renderChart);
+  window.addEventListener('themechange', renderChart);
+});
+
+// ── Info ──────────────────────────────────────────────────────────────────
+async function fetchInfo() {
+  try {
+    const r = await fetch('/api/piezo/info');
+    const d = await r.json();
+    if (!d.connected) { setDisconnected(d.error || 'Not connected'); return; }
+    maxVoltage = d.max_voltage;
+    document.getElementById('hdr-model').textContent = d.model;
+    document.getElementById('hdr-sn').textContent    = 'S/N ' + d.serial;
+    document.getElementById('hdr-fw').textContent    = 'FW ' + d.firmware;
+    document.getElementById('hdr-port').textContent  = d.port;
+    document.getElementById('bar-max').textContent   = maxVoltage + ' V';
+    document.getElementById('slider-max-lbl').textContent = maxVoltage + ' V';
+    const slider = document.getElementById('volt-slider');
+    slider.max = maxVoltage;
+    document.getElementById('volt-input').max = maxVoltage;
+    document.getElementById('sw-stop').value = maxVoltage;
+
+    // Closed-loop travel range
+    maxTravel = d.max_travel || 30.0;
+    document.getElementById('pos-bar-max').textContent   = maxTravel + ' µm';
+    document.getElementById('pos-slider-max').textContent = maxTravel + ' µm';
+    const ps = document.getElementById('pos-slider');
+    ps.max = maxTravel;
+    document.getElementById('pos-input').max = maxTravel;
+
+    setConnected();
+    clearAlert();
+  } catch(e) { setDisconnected(e.message); }
+}
+
+// ── Polling ───────────────────────────────────────────────────────────────
+function startPolling() {
+  if (pollTimer) clearInterval(pollTimer);
+  pollTimer = setInterval(poll, 300);
+}
+
+async function poll() {
+  try {
+    const r = await fetch('/api/piezo/status');
+    const d = await r.json();
+    if (!d.connected) { setDisconnected(d.error || 'Not responding'); return; }
+    updateUI(d);
+    clearAlert();
+  } catch(e) { /* network hiccup — ignore */ }
+}
+
+// ── UI Update ─────────────────────────────────────────────────────────────
+function updateUI(d) {
+  setConnected();
+
+  const v = d.voltage;
+  history.push({ t: Date.now(), v });
+  const cutoff = Date.now() - CHART_DURATION;
+  history = history.filter(p => p.t >= cutoff);
+
+  // Displays
+  document.getElementById('read-v-disp').textContent = v.toFixed(2);
+  document.getElementById('set-v-disp').textContent  = currentSetV.toFixed(2);
+
+  // Bar
+  const pct = Math.max(0, Math.min(100, (v / maxVoltage) * 100));
+  document.getElementById('volt-fill').style.width = pct + '%';
+
+  // Piezo connected
+  const ledPiezo = document.getElementById('led-piezo');
+  const lblPiezo = document.getElementById('lbl-piezo');
+  ledPiezo.className = d.piezo_connected ? 'led green' : 'led red';
+  lblPiezo.textContent = d.piezo_connected ? 'Piezo Connected' : 'Piezo Not Detected';
+
+  // Strain gauge
+  const ledSG = document.getElementById('led-sg');
+  const lblSG = document.getElementById('lbl-sg');
+  ledSG.className = d.strain_gauge_connected ? 'led green' : 'led';
+  lblSG.textContent = d.strain_gauge_connected
+    ? 'Strain Gauge: Connected'
+    : 'Strain Gauge: Not Connected';
+
+  // Loop mode
+  const ledLoop = document.getElementById('led-loop');
+  const lblLoop = document.getElementById('lbl-loop');
+  ledLoop.className = d.closed_loop ? 'led green' : 'led orange';
+  lblLoop.textContent = d.closed_loop ? 'Closed Loop' : 'Open Loop';
+
+  // Zero state
+  const ledZero = document.getElementById('led-zero');
+  const lblZero = document.getElementById('lbl-zero');
+  if (d.zeroing) {
+    ledZero.className = 'led orange'; lblZero.textContent = "Zeroing…";
+  } else if (d.zeroed) {
+    ledZero.className = 'led green';  lblZero.textContent = "Zero'd";
+  } else {
+    ledZero.className = 'led';        lblZero.textContent = "Not Zero'd";
+  }
+
+  // Enable/disable button
+  const btnOut = document.getElementById('btn-output');
+  outputEnabled = d.piezo_connected;
+  if (d.piezo_connected) {
+    btnOut.textContent = 'Disable Output';
+    btnOut.className = 'btn btn-full btn-danger';
+  } else {
+    btnOut.textContent = 'Enable Output';
+    btnOut.className = 'btn btn-full btn-success';
+  }
+
+  // Sweep
+  const swInd = document.getElementById('sweep-indicator');
+  const btnSS = document.getElementById('btn-sweep-start');
+  const btnSP = document.getElementById('btn-sweep-stop');
+  if (d.sweep_active) {
+    swInd.classList.add('active');
+    btnSS.disabled = true;
+    btnSP.disabled = false;
+  } else {
+    swInd.classList.remove('active');
+    btnSS.disabled = false;
+    btnSP.disabled = true;
+  }
+
+  updateClosedLoop(d);
+  renderChart();
+}
+
+// ── Closed-loop UI ──────────────────────────────────────────────────────────
+function updateClosedLoop(d) {
+  closedLoop = !!d.closed_loop;
+  busyState  = d.busy || null;
+
+  // Position display + bar
+  const pos = (d.position != null) ? d.position : 0;
+  document.getElementById('pos-disp').textContent = pos.toFixed(3);
+  const pct = Math.max(0, Math.min(100, (pos / maxTravel) * 100));
+  document.getElementById('pos-fill').style.width = pct + '%';
+
+  // Voltage controls are inert in closed loop — dim them.
+  ['voltage-panel', 'jog-panel', 'sweep-panel'].forEach(id => {
+    document.getElementById(id).classList.toggle('disabled-panel', closedLoop);
+  });
+
+  const setup    = document.getElementById('cl-setup');
+  const controls = document.getElementById('cl-controls');
+  const movingBox = document.getElementById('cl-moving');
+
+  // Don't flip panels while an operation owns the link — those views are
+  // driven by the button handlers (startZero / move…).
+  if (busyState === 'zeroing') return;
+  movingBox.style.display = (busyState === 'moving') ? 'flex' : 'none';
+
+  if (closedLoop) {
+    setup.style.display = 'none';
+    controls.style.display = 'block';
+  } else {
+    setup.style.display = 'block';
+    controls.style.display = 'none';
+    document.getElementById('cl-zeroing').style.display = 'none';
+  }
+}
+
+// ── Zeroing workflow ────────────────────────────────────────────────────────
+async function startZero() {
+  document.getElementById('btn-zero-start').disabled = true;
+  try {
+    const r = await fetch('/api/piezo/zero/start', { method: 'POST' });
+    const d = await r.json();
+    if (d.error) { showAlert(d.error); document.getElementById('btn-zero-start').disabled = false; return; }
+    document.getElementById('cl-zeroing').style.display = 'block';
+  } catch(e) { showAlert('Zero failed: ' + e.message); document.getElementById('btn-zero-start').disabled = false; }
+}
+
+async function confirmZeroed() {
+  const btn = document.getElementById('btn-zero-confirm');
+  btn.disabled = true; btn.textContent = 'Confirming…';
+  try {
+    const r = await fetch('/api/piezo/zero/confirm', { method: 'POST' });
+    const d = await r.json();
+    if (!d.closed_loop) showAlert('Zeroed but not in closed loop — check the actuator.');
+    document.getElementById('cl-zeroing').style.display = 'none';
+  } catch(e) { showAlert('Confirm failed: ' + e.message); }
+  finally {
+    btn.disabled = false; btn.textContent = '✓ Zeroed LED is Solid — Confirm';
+    document.getElementById('btn-zero-start').disabled = false;
+  }
+}
+
+async function cancelZero() {
+  await fetch('/api/piezo/zero/cancel', { method: 'POST' });
+  document.getElementById('cl-zeroing').style.display = 'none';
+  document.getElementById('btn-zero-start').disabled = false;
+}
+
+// ── Move ────────────────────────────────────────────────────────────────────
+async function moveTo(um) {
+  um = Math.max(0, Math.min(maxTravel, parseFloat(um) || 0));
+  document.getElementById('pos-slider').value = um;
+  document.getElementById('pos-input').value  = um.toFixed(2);
+  document.getElementById('pos-slider-live').textContent = um.toFixed(2) + ' µm';
+  document.getElementById('cl-moving').style.display = 'flex';
+  document.getElementById('btn-move').disabled = true;
+  try {
+    const r = await fetch('/api/piezo/move', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ position: um })
+    });
+    const d = await r.json();
+    if (d.error) { showAlert(d.error); }
+    else {
+      document.getElementById('pos-disp').textContent = d.position.toFixed(3);
+      if (!d.reached) showAlert(`Move settled at ${d.position.toFixed(2)} µm (target ${um.toFixed(2)})`);
+    }
+  } catch(e) { showAlert('Move failed: ' + e.message); }
+  finally {
+    document.getElementById('cl-moving').style.display = 'none';
+    document.getElementById('btn-move').disabled = false;
+  }
+}
+
+function onPosSliderInput(val) {
+  const um = parseFloat(val);
+  document.getElementById('pos-slider-live').textContent = um.toFixed(2) + ' µm';
+  document.getElementById('pos-input').value = um.toFixed(2);
+}
+function onPosSliderCommit(val) { moveTo(parseFloat(val)); }
+function applyPosInput() { moveTo(document.getElementById('pos-input').value); }
+function movePercent(pct)  { moveTo((pct / 100) * maxTravel); }
+
+async function returnOpenLoop() {
+  try {
+    await fetch('/api/piezo/mode/open', { method: 'POST' });
+  } catch(e) { showAlert('Mode change failed: ' + e.message); }
+}
+
+// ── Voltage commands ──────────────────────────────────────────────────────
+async function setVoltage(v) {
+  v = Math.max(0, Math.min(maxVoltage, parseFloat(v) || 0));
+  currentSetV = v;
+  document.getElementById('volt-slider').value = v;
+  document.getElementById('volt-input').value  = v.toFixed(2);
+  document.getElementById('slider-live').textContent = v.toFixed(2) + ' V';
+  document.getElementById('set-v-disp').textContent  = v.toFixed(2);
+  try {
+    await fetch('/api/piezo/voltage', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({voltage: v})
+    });
+  } catch(e) { showAlert('Set voltage failed: ' + e.message); }
+}
+
+function onSliderInput(val) {
+  const v = parseFloat(val);
+  document.getElementById('slider-live').textContent = v.toFixed(2) + ' V';
+  document.getElementById('volt-input').value = v.toFixed(2);
+  document.getElementById('set-v-disp').textContent = v.toFixed(2);
+}
+
+function onSliderCommit(val) { setVoltage(parseFloat(val)); }
+
+function applyVoltageInput() {
+  setVoltage(document.getElementById('volt-input').value);
+}
+
+function setPercent(pct) { setVoltage((pct / 100) * maxVoltage); }
+
+// ── Jog ───────────────────────────────────────────────────────────────────
+function jog(delta)    { setVoltage(currentSetV + delta); }
+function jogTo(v)      { setVoltage(v); }
+function setJogStep(s) { document.getElementById('jog-step').value = s; }
+function jogByStep(dir) {
+  const step = parseFloat(document.getElementById('jog-step').value) || 1;
+  jog(dir * step);
+}
+
+// ── Sweep ─────────────────────────────────────────────────────────────────
+async function startSweep() {
+  await fetch('/api/piezo/sweep/start', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({
+      start:  parseFloat(document.getElementById('sw-start').value),
+      stop:   parseFloat(document.getElementById('sw-stop').value),
+      steps:  parseInt(document.getElementById('sw-steps').value),
+      dwell:  parseFloat(document.getElementById('sw-dwell').value),
+      repeat: document.getElementById('sw-repeat').checked,
+    })
+  });
+}
+
+async function stopSweep() {
+  await fetch('/api/piezo/sweep/stop', { method: 'POST' });
+}
+
+// ── Actions ───────────────────────────────────────────────────────────────
+async function cmdIdentify() {
+  await fetch('/api/piezo/identify', { method: 'POST' });
+}
+
+async function toggleOutput() {
+  await fetch('/api/piezo/output', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({enable: !outputEnabled})
+  });
+}
+
+async function cmdReconnect() {
+  setDisconnected('Reconnecting…');
+  await fetch('/api/piezo/reconnect', { method: 'POST' });
+  fetchInfo();
+}
+
+// ── Connection state ──────────────────────────────────────────────────────
+function setConnected() {
+  document.getElementById('conn-led').className  = 'led green';
+  document.getElementById('conn-text').textContent = 'Connected';
+}
+
+function setDisconnected(msg) {
+  document.getElementById('conn-led').className  = 'led red';
+  document.getElementById('conn-text').textContent = 'Disconnected';
+  if (msg) showAlert(msg);
+}
+
+function showAlert(msg) {
+  const el = document.getElementById('alert');
+  el.textContent = '⚠ ' + msg;
+  el.classList.add('show');
+}
+
+function clearAlert() {
+  document.getElementById('alert').classList.remove('show');
+}
+
+// ── Chart (instrument-style: stays dark in both themes) ───────────────────
+function renderChart() {
+  const canvas = document.getElementById('chart');
+  const dpr    = window.devicePixelRatio || 1;
+  const W      = canvas.parentElement.clientWidth - 36;
+  const H      = 120;
+  canvas.style.width  = W + 'px';
+  canvas.style.height = H + 'px';
+  canvas.width  = W * dpr;
+  canvas.height = H * dpr;
+  const ctx = canvas.getContext('2d');
+  ctx.scale(dpr, dpr);
+
+  const lineCol = cssVar('--display-fg');
+
+  // Background
+  ctx.fillStyle = cssVar('--display-bg');
+  ctx.fillRect(0, 0, W, H);
+
+  // Grid
+  const GRID_ROWS = 4;
+  const GRID_COLS = 6;
+  ctx.strokeStyle = 'rgba(128,140,160,.10)';
+  ctx.lineWidth = 1;
+  for (let i = 1; i < GRID_ROWS; i++) {
+    const y = (i / GRID_ROWS) * H;
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
+  }
+  for (let i = 1; i < GRID_COLS; i++) {
+    const x = (i / GRID_COLS) * W;
+    ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, H); ctx.stroke();
+  }
+
+  // Y-axis labels
+  ctx.fillStyle = 'rgba(139,147,162,.7)';
+  ctx.font = '9px Menlo, Consolas, monospace';
+  ctx.textAlign = 'right';
+  for (let i = 0; i <= GRID_ROWS; i++) {
+    const v   = maxVoltage * (1 - i / GRID_ROWS);
+    const y   = (i / GRID_ROWS) * H;
+    ctx.fillText(v.toFixed(0) + 'V', W - 3, y + 3);
+  }
+
+  if (history.length < 2) return;
+
+  const now  = Date.now();
+  const tMin = now - CHART_DURATION;
+
+  // Map to canvas coords
+  function tx(t) { return ((t - tMin) / CHART_DURATION) * W; }
+  function ty(v) { return H - (v / maxVoltage) * H; }
+
+  // Fill under curve
+  ctx.beginPath();
+  ctx.moveTo(tx(history[0].t), H);
+  for (const p of history) ctx.lineTo(tx(p.t), ty(p.v));
+  ctx.lineTo(tx(history[history.length - 1].t), H);
+  ctx.closePath();
+  const grad = ctx.createLinearGradient(0, 0, 0, H);
+  grad.addColorStop(0,   'rgba(111,211,228,.18)');
+  grad.addColorStop(1,   'rgba(111,211,228,.02)');
+  ctx.fillStyle = grad;
+  ctx.fill();
+
+  // Line
+  ctx.beginPath();
+  ctx.moveTo(tx(history[0].t), ty(history[0].v));
+  for (const p of history) ctx.lineTo(tx(p.t), ty(p.v));
+  ctx.strokeStyle = lineCol;
+  ctx.lineWidth   = 1.5;
+  ctx.lineJoin    = 'round';
+  ctx.stroke();
+
+  // Current value dot
+  const last = history[history.length - 1];
+  ctx.beginPath();
+  ctx.arc(tx(last.t), ty(last.v), 3, 0, Math.PI * 2);
+  ctx.fillStyle = lineCol;
+  ctx.fill();
+}
+</script>
+</body>
+</html>

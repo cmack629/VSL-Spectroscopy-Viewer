@@ -1,0 +1,528 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Power Meter — VSL Scan</title>
+<link rel="stylesheet" href="/static/style.css">
+<script src="/static/theme.js"></script>
+<style>
+#app { display:flex; flex-direction:column; height:100%; min-height:100vh; }
+
+#alert { display:none; padding:7px 14px; font-size:12px;
+  background:rgba(217,95,95,.10); color:var(--red); border-bottom:1px solid var(--red); }
+#alert.show { display:block; }
+
+#main { display:grid; grid-template-columns:250px 1fr; flex:1; overflow:hidden; }
+#sidebar { background:var(--surface); border-right:1px solid var(--border);
+  display:flex; flex-direction:column; overflow-y:auto; }
+.sidebar-block { padding:14px 16px; border-bottom:1px solid var(--border); }
+#content { display:flex; flex-direction:column; overflow-y:auto; }
+.content-row { display:grid; grid-template-columns:1fr 1fr; gap:1px;
+  background:var(--border); flex-shrink:0; }
+
+.bigreadout { font-size:56px; line-height:1.05; }
+.bigreadout .display-unit { font-size:24px; }
+.subreadout { font-size:22px; }
+.subreadout .display-unit { font-size:13px; }
+
+.volt-track { height:6px; background:var(--display-bg); border-radius:3px;
+  border:1px solid var(--display-brd); overflow:hidden; }
+.volt-fill { height:100%; width:0%; background:var(--accent);
+  border-radius:3px; transition:width .15s ease; }
+.volt-labels { display:flex; justify-content:space-between; font-size:10px;
+  color:var(--text3); margin-top:3px; }
+
+select { background:var(--surface); border:1px solid var(--border2); border-radius:5px;
+  color:var(--text); font-size:13px; padding:6px 8px; outline:none; width:100%; }
+
+.presets { display:flex; gap:4px; margin-top:8px; flex-wrap:wrap; }
+.preset-btn { flex:1; min-width:42px; }
+
+.stat-grid { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+.stat-cell { background:var(--display-bg); border:1px solid var(--display-brd);
+  border-radius:var(--radius); padding:8px 10px; }
+.stat-cell .lbl { font-size:9px; text-transform:uppercase; letter-spacing:.08em; color:var(--text2); }
+.stat-cell .val { font-family:var(--mono); font-size:15px; color:var(--display-fg); margin-top:2px; }
+
+.status-row { display:flex; align-items:center; gap:8px; padding:5px 0; font-size:12px; }
+#chart-section { background:var(--surface); border-top:1px solid var(--border);
+  padding:14px 18px 12px; flex:1; min-height:240px; display:flex; flex-direction:column; }
+#chart { width:100%; flex:1; display:block; min-height:200px; }
+
+.toggle-group { display:flex; gap:4px; }
+.toggle-group .btn { flex:1; }
+.btn.active { background:var(--primary); border-color:var(--primary); color:#fff; }
+
+.chip-sm { font-size:10px; padding:1px 7px; border-radius:10px; border:1px solid var(--border2);
+  color:var(--text2); }
+.chip-sm.on { color:var(--green); border-color:var(--green); }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="alert"></div>
+
+  <header class="app-header">
+    <span class="wordmark">Thorlabs <span id="hdr-model">PM400</span><small>optical power meter</small></span>
+    <nav class="app-nav">
+      <a href="/">Scan</a>
+      <a href="/piezo">Piezo</a>
+      <a href="/stage">Stage</a>
+      <a href="/power" class="active">Power meter</a>
+      <a href="/hr4000">HR4000</a>
+      <a href="/avantes">Avantes</a>
+    </nav>
+    <div class="header-right">
+      <span class="badge" id="hdr-sn">—</span>
+      <span class="badge" id="hdr-fw">—</span>
+      <span class="badge" id="hdr-sensor">—</span>
+      <span class="pill" id="conn-indicator">
+        <span class="led" id="conn-led"></span>
+        <span id="conn-text">Connecting…</span>
+      </span>
+      <button class="theme-toggle" onclick="toggleTheme()"></button>
+    </div>
+  </header>
+
+  <div id="main">
+
+    <!-- Sidebar -->
+    <div id="sidebar">
+
+      <!-- Sensor info -->
+      <div class="sidebar-block">
+        <h3>Sensor</h3>
+        <div class="status-row"><span class="led" id="led-sensor"></span><span id="sensor-name">—</span></div>
+        <div style="font-size:11px;color:var(--text2);line-height:1.7">
+          <div>Type: <span id="sensor-type">—</span></div>
+          <div>S/N: <span id="sensor-sn">—</span></div>
+          <div>Cal: <span id="sensor-cal">—</span></div>
+        </div>
+      </div>
+
+      <!-- Wavelength -->
+      <div class="sidebar-block">
+        <h3>Wavelength</h3>
+        <div class="form-row" style="margin-bottom:6px">
+          <div class="form-col">
+            <div class="input-row">
+              <input type="number" id="wl-input" step="1" value="635"
+                     onkeydown="if(event.key==='Enter') applyWavelength()">
+              <span class="input-unit">nm</span>
+            </div>
+          </div>
+          <button class="btn btn-primary" onclick="applyWavelength()" style="align-self:flex-end">Set</button>
+        </div>
+        <div class="presets">
+          <button class="btn btn-sm preset-btn" onclick="setWl(405)">405</button>
+          <button class="btn btn-sm preset-btn" onclick="setWl(532)">532</button>
+          <button class="btn btn-sm preset-btn" onclick="setWl(635)">635</button>
+          <button class="btn btn-sm preset-btn" onclick="setWl(780)">780</button>
+          <button class="btn btn-sm preset-btn" onclick="setWl(1064)">1064</button>
+        </div>
+        <div style="font-size:10px;color:var(--text3);margin-top:6px" id="wl-range">range —</div>
+      </div>
+
+      <!-- Range & averaging -->
+      <div class="sidebar-block">
+        <h3>Acquisition</h3>
+        <div class="form-label" style="margin-bottom:4px">Range</div>
+        <div class="toggle-group" style="margin-bottom:10px">
+          <button class="btn btn-sm" id="btn-auto" onclick="setAuto(true)">Auto</button>
+          <button class="btn btn-sm" id="btn-manual" onclick="setAuto(false)">Manual</button>
+        </div>
+        <div class="form-label" style="margin-bottom:4px">Averaging (samples)</div>
+        <div class="form-row" style="margin-bottom:8px">
+          <div class="form-col">
+            <input type="number" id="avg-input" min="1" max="10000" step="1" value="1"
+                   onkeydown="if(event.key==='Enter') applyAveraging()">
+          </div>
+          <button class="btn btn-primary" onclick="applyAveraging()" style="align-self:flex-end">Set</button>
+        </div>
+        <div class="form-label" style="margin-bottom:4px">Sample rate</div>
+        <select id="rate-select" onchange="applyRate()">
+          <option value="2">2 Hz</option>
+          <option value="5">5 Hz</option>
+          <option value="10" selected>10 Hz</option>
+          <option value="20">20 Hz</option>
+        </select>
+      </div>
+
+      <!-- Zero -->
+      <div class="sidebar-block" style="display:flex;flex-direction:column;gap:7px">
+        <h3><span class="hint" title="Block the beam, then run a dark adjustment">Zero (dark offset)</span></h3>
+        <button class="btn btn-accent btn-full" onclick="doZero()">Zero adjust</button>
+        <button class="btn btn-sm btn-full" onclick="clearZero()">Clear zero</button>
+        <div style="font-size:10px;color:var(--text3)" id="zero-mag">—</div>
+      </div>
+
+      <div class="sidebar-block" style="display:flex;flex-direction:column;gap:7px">
+        <button class="btn btn-sm btn-full" style="color:var(--text3)" onclick="cmdReconnect()">Reconnect</button>
+      </div>
+
+    </div><!-- /sidebar -->
+
+    <!-- Content -->
+    <div id="content">
+
+      <div class="content-row">
+        <!-- Main readout -->
+        <div class="panel">
+          <div class="display-label">Optical Power</div>
+          <div class="display-box bigreadout" id="disp-power">
+            <span id="power-val">—</span><span class="display-unit" id="power-unit">W</span>
+          </div>
+          <div style="display:flex;gap:8px;margin-top:10px">
+            <div style="flex:1">
+              <div class="display-label" id="sub-label">Power (dBm)</div>
+              <div class="display-box subreadout" id="disp-sub">
+                <span id="sub-val">—</span><span class="display-unit" id="sub-unit">dBm</span>
+              </div>
+            </div>
+          </div>
+          <div style="margin-top:10px">
+            <div class="volt-track"><div class="volt-fill" id="range-fill"></div></div>
+            <div class="volt-labels"><span>0</span><span id="range-max">range —</span></div>
+          </div>
+          <div style="display:flex;gap:6px;margin-top:8px;align-items:center">
+            <span class="chip-sm" id="chip-auto">AUTO</span>
+            <span class="chip-sm" id="chip-over">OVER</span>
+            <span style="margin-left:auto;font-size:11px;color:var(--text2)" id="current-read">I = —</span>
+          </div>
+        </div>
+
+        <!-- Secondary display mode + statistics -->
+        <div class="panel">
+          <h3>Display Units</h3>
+          <div class="toggle-group" style="margin-bottom:14px">
+            <button class="btn btn-sm active" id="mode-w"   onclick="setMode('W')">Watt</button>
+            <button class="btn btn-sm"        id="mode-dbm" onclick="setMode('dBm')">dBm</button>
+            <button class="btn btn-sm"        id="mode-den" onclick="setMode('density')">W/cm²</button>
+          </div>
+          <div id="beam-row" style="display:none;margin-bottom:12px">
+            <div class="form-label" style="margin-bottom:4px">Beam diameter</div>
+            <div class="input-row">
+              <input type="number" id="beam-input" min="0.01" step="0.1" value="1.0" oninput="renderAll()">
+              <span class="input-unit">mm</span>
+            </div>
+          </div>
+
+          <div style="display:flex;justify-content:space-between;align-items:center">
+            <h3 style="margin-bottom:0">Statistics</h3>
+            <button class="btn btn-sm" onclick="resetStats()">Reset</button>
+          </div>
+          <div class="stat-grid" style="margin-top:10px">
+            <div class="stat-cell"><div class="lbl">Min</div><div class="val" id="st-min">—</div></div>
+            <div class="stat-cell"><div class="lbl">Max</div><div class="val" id="st-max">—</div></div>
+            <div class="stat-cell"><div class="lbl">Mean</div><div class="val" id="st-mean">—</div></div>
+            <div class="stat-cell"><div class="lbl">Std Dev</div><div class="val" id="st-std">—</div></div>
+            <div class="stat-cell"><div class="lbl">Samples</div><div class="val" id="st-n">0</div></div>
+            <div class="stat-cell"><div class="lbl">Pk-Pk</div><div class="val" id="st-pp">—</div></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Logging bar -->
+      <div class="panel" style="border-top:1px solid var(--border);display:flex;align-items:center;gap:10px">
+        <h3 style="margin-bottom:0">Data Logging</h3>
+        <button class="btn btn-success" id="btn-log-start" onclick="startLog()">Start log</button>
+        <button class="btn btn-danger"  id="btn-log-stop"  onclick="stopLog()" disabled>Stop</button>
+        <a class="btn btn-accent" id="btn-log-dl" href="/api/power/log/download">Download CSV</a>
+        <a class="btn btn-sec" id="btn-plot" href="/api/power/plot"
+           title="Matplotlib figure of the power-vs-time chart">Plot PNG</a>
+        <span style="margin-left:auto;font-size:11px;color:var(--text2)" id="log-status">Idle</span>
+      </div>
+
+      <!-- Chart -->
+      <div id="chart-section">
+        <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px">
+          <h3 style="margin-bottom:0">Power vs Time</h3>
+          <label class="chk" style="font-size:11px;color:var(--text2)">
+            <input type="checkbox" id="log-y" style="width:auto" onchange="renderChart()"> Log scale
+          </label>
+          <span style="margin-left:auto;font-size:11px;color:var(--text2)" id="chart-span">last 120 s</span>
+        </div>
+        <canvas id="chart"></canvas>
+      </div>
+
+    </div><!-- /content -->
+  </div><!-- /main -->
+</div>
+
+<script>
+// ── State ──────────────────────────────────────────────────────────────
+let wlMin = 200, wlMax = 1100;
+let displayMode = 'W';            // 'W' | 'dBm' | 'density'
+let autoRange = true;
+let chartData = { t: [], p: [], span_s: 120 };
+let lastPowerW = 0;
+
+window.addEventListener('DOMContentLoaded', () => {
+  fetchInfo();
+  setInterval(poll, 200);
+  setInterval(fetchChart, 500);
+  setInterval(fetchStats, 500);
+  window.addEventListener('resize', renderChart);
+  window.addEventListener('themechange', renderChart);
+});
+
+// ── Info ───────────────────────────────────────────────────────────────
+async function fetchInfo() {
+  try {
+    const d = await (await fetch('/api/power/info')).json();
+    if (!d.connected) { setDisconnected(d.error || 'Not connected'); return; }
+    document.getElementById('hdr-model').textContent  = d.model;
+    document.getElementById('hdr-sn').textContent     = 'S/N ' + d.serial;
+    document.getElementById('hdr-fw').textContent     = 'FW ' + d.firmware;
+    document.getElementById('hdr-sensor').textContent = d.sensor.name || 'No sensor';
+    document.getElementById('sensor-name').textContent = d.sensor.name || 'No sensor';
+    document.getElementById('led-sensor').className = d.sensor.connected ? 'led green' : 'led red';
+    document.getElementById('sensor-type').textContent = d.sensor.type;
+    document.getElementById('sensor-sn').textContent   = d.sensor.serial;
+    document.getElementById('sensor-cal').textContent  = d.sensor.cal_date;
+    wlMin = d.wl_min; wlMax = d.wl_max;
+    document.getElementById('wl-range').textContent = `range ${wlMin}–${wlMax} nm`;
+    document.getElementById('wl-input').value = Math.round(d.wavelength);
+    document.getElementById('avg-input').value = d.averaging;
+    autoRange = d.auto_range;
+    setAutoUI(autoRange);
+    setConnected();
+    clearAlert();
+  } catch(e) { setDisconnected(e.message); }
+}
+
+// ── Poll ───────────────────────────────────────────────────────────────
+async function poll() {
+  try {
+    const d = await (await fetch('/api/power/status')).json();
+    if (!d.connected) { setDisconnected(d.error || 'Not responding'); return; }
+    setConnected(); clearAlert();
+    lastPowerW = d.power_w;
+    autoRange = d.auto_range;
+
+    // Main readout
+    document.getElementById('power-val').textContent  = fmtMain().val;
+    document.getElementById('power-unit').textContent = fmtMain().unit;
+
+    // Secondary readout
+    renderSub(d);
+
+    // Range bar / chips
+    const pct = d.range_w > 0 ? Math.max(0, Math.min(100, (d.power_w / d.range_w) * 100)) : 0;
+    document.getElementById('range-fill').style.width = pct + '%';
+    const rmax = scale(d.range_w);
+    document.getElementById('range-max').textContent = rmax.val + ' ' + rmax.unit;
+    document.getElementById('chip-auto').className = 'chip-sm ' + (d.auto_range ? 'on' : '');
+    document.getElementById('chip-over').className = 'chip-sm ' + (d.overrange ? 'on' : '');
+    document.getElementById('chip-over').style.color = d.overrange ? 'var(--red)' : '';
+    document.getElementById('chip-over').style.borderColor = d.overrange ? 'var(--red)' : '';
+    document.getElementById('current-read').textContent =
+      d.current_a == null ? 'I = —' : 'I = ' + sci(d.current_a) + ' A';
+
+    // Logging state
+    setLogUI(d.logging);
+  } catch(e) {}
+}
+
+// ── Formatting helpers ─────────────────────────────────────────────────
+function scale(w) {
+  const a = Math.abs(w);
+  if (a === 0) return { val: '0.000', unit: 'W' };
+  const units = [[1e-9,1e12,'pW'],[1e-6,1e9,'nW'],[1e-3,1e6,'µW'],[1e0,1e3,'mW']];
+  for (const [th,sc,u] of units) if (a < th) return { val:(w*sc).toFixed(3), unit:u };
+  return { val: w.toFixed(3), unit:'W' };
+}
+function sci(x) { return x.toExponential(3); }
+function toDbm(w) { return w > 0 ? (10*Math.log10(w/1e-3)).toFixed(3) : '−∞'; }
+function toDensity(w) {
+  const d = parseFloat(document.getElementById('beam-input').value) || 1;
+  const area = Math.PI * Math.pow(d/20, 2);     // cm², r=d_mm/2/10
+  return w/area;
+}
+
+function fmtMain() {
+  if (displayMode === 'dBm') return { val: toDbm(lastPowerW), unit: 'dBm' };
+  if (displayMode === 'density') {
+    const s = scale(toDensity(lastPowerW));
+    return { val: s.val, unit: s.unit + '/cm²' };
+  }
+  return scale(lastPowerW);
+}
+
+function renderSub(d) {
+  // Secondary always shows the "other useful" reading.
+  let label, val, unit;
+  if (displayMode === 'dBm') { label='Power'; const s=scale(d.power_w); val=s.val; unit=s.unit; }
+  else { label='Power (dBm)'; val=toDbm(d.power_w); unit='dBm'; }
+  document.getElementById('sub-label').textContent = label;
+  document.getElementById('sub-val').textContent = val;
+  document.getElementById('sub-unit').textContent = unit;
+}
+
+function renderAll() {
+  document.getElementById('power-val').textContent  = fmtMain().val;
+  document.getElementById('power-unit').textContent = fmtMain().unit;
+}
+
+// ── Display mode ───────────────────────────────────────────────────────
+function setMode(m) {
+  displayMode = m;
+  for (const [id,mode] of [['mode-w','W'],['mode-dbm','dBm'],['mode-den','density']])
+    document.getElementById(id).classList.toggle('active', mode===m);
+  document.getElementById('beam-row').style.display = (m==='density') ? 'block' : 'none';
+  renderAll();
+}
+
+// ── Chart (instrument-style: stays dark in both themes) ────────────────
+async function fetchChart() {
+  try { chartData = await (await fetch('/api/power/chart')).json(); renderChart(); } catch(e) {}
+}
+
+function renderChart() {
+  const canvas = document.getElementById('chart');
+  const dpr = window.devicePixelRatio || 1;
+  const W = canvas.parentElement.clientWidth - 36;
+  const H = Math.max(180, canvas.clientHeight || 200);
+  canvas.style.width = W+'px'; canvas.width = W*dpr; canvas.height = H*dpr;
+  const ctx = canvas.getContext('2d'); ctx.setTransform(dpr,0,0,dpr,0,0);
+  ctx.fillStyle = cssVar('--display-bg'); ctx.fillRect(0,0,W,H);
+  const lineCol = cssVar('--display-fg'), tickCol = cssVar('--plot-tick');
+
+  const logY = document.getElementById('log-y').checked;
+  const pts = chartData.p, ts = chartData.t;
+  const n = pts.length;
+
+  // Y range
+  let pmin = Infinity, pmax = -Infinity;
+  for (const p of pts) {
+    const v = logY ? (p>0?p:Infinity) : p;
+    if (logY && p<=0) continue;
+    if (v<pmin) pmin=v; if (v>pmax) pmax=v;
+  }
+  if (!isFinite(pmin) || !isFinite(pmax)) { pmin=0; pmax=1e-9; }
+  if (pmin===pmax) { pmax = pmin + Math.abs(pmin||1e-12)*0.1 + 1e-15; }
+  const pad = (pmax-pmin)*0.08;
+  let lo = logY ? pmin : pmin-pad, hi = logY ? pmax : pmax+pad;
+  if (logY) { lo = Math.log10(pmin); hi = Math.log10(pmax); }
+
+  // Grid + Y labels
+  ctx.strokeStyle='rgba(128,140,160,.10)'; ctx.lineWidth=1;
+  ctx.fillStyle=tickCol; ctx.font='9px Menlo, Consolas, monospace'; ctx.textAlign='right';
+  const ROWS=4;
+  for (let i=0;i<=ROWS;i++) {
+    const y=(i/ROWS)*H;
+    ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(W,y); ctx.stroke();
+    const frac=1-i/ROWS;
+    let val = logY ? Math.pow(10, lo+frac*(hi-lo)) : lo+frac*(hi-lo);
+    const s = scale(val);
+    ctx.fillText(s.val+s.unit, W-3, Math.min(H-2,Math.max(8,y+3)));
+  }
+  const COLS=6;
+  for (let i=1;i<COLS;i++){const x=(i/COLS)*W;ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,H);ctx.stroke();}
+
+  if (n<2) return;
+  const now = ts[n-1];
+  const span = chartData.span_s*1000;
+  const tMin = now - span;
+  const tx = t => ((t-tMin)/span)*W;
+  const ty = p => {
+    let v = logY ? Math.log10(p>0?p:1e-15) : p;
+    return H - ((v-lo)/(hi-lo))*H;
+  };
+
+  // Fill
+  ctx.beginPath(); ctx.moveTo(tx(ts[0]),H);
+  for (let i=0;i<n;i++) ctx.lineTo(tx(ts[i]),ty(pts[i]));
+  ctx.lineTo(tx(ts[n-1]),H); ctx.closePath();
+  const g=ctx.createLinearGradient(0,0,0,H);
+  g.addColorStop(0,'rgba(111,211,228,.18)'); g.addColorStop(1,'rgba(111,211,228,.02)');
+  ctx.fillStyle=g; ctx.fill();
+
+  // Line
+  ctx.beginPath(); ctx.moveTo(tx(ts[0]),ty(pts[0]));
+  for (let i=0;i<n;i++) ctx.lineTo(tx(ts[i]),ty(pts[i]));
+  ctx.strokeStyle=lineCol; ctx.lineWidth=1.5; ctx.lineJoin='round'; ctx.stroke();
+
+  // Last dot
+  ctx.beginPath(); ctx.arc(tx(ts[n-1]),ty(pts[n-1]),3,0,Math.PI*2);
+  ctx.fillStyle=lineCol; ctx.fill();
+  document.getElementById('chart-span').textContent = 'last ' + chartData.span_s + ' s';
+}
+
+// ── Statistics ─────────────────────────────────────────────────────────
+async function fetchStats() {
+  try {
+    const s = await (await fetch('/api/power/stats')).json();
+    if (!s.n) { document.getElementById('st-n').textContent='0'; return; }
+    const f = w => { const x=scale(w); return x.val+' '+x.unit; };
+    document.getElementById('st-min').textContent  = f(s.min);
+    document.getElementById('st-max').textContent  = f(s.max);
+    document.getElementById('st-mean').textContent = f(s.mean);
+    document.getElementById('st-std').textContent  = f(s.std);
+    document.getElementById('st-pp').textContent   = f(s.max - s.min);
+    document.getElementById('st-n').textContent    = s.n;
+  } catch(e) {}
+}
+async function resetStats() { await fetch('/api/power/stats/reset',{method:'POST'}); }
+
+// ── Controls ───────────────────────────────────────────────────────────
+async function applyWavelength() {
+  const nm = parseFloat(document.getElementById('wl-input').value);
+  await post('/api/power/wavelength', { wavelength: nm });
+}
+function setWl(nm){ document.getElementById('wl-input').value=nm; applyWavelength(); }
+async function applyAveraging() {
+  await post('/api/power/averaging', { count: parseInt(document.getElementById('avg-input').value) });
+}
+async function applyRate() {
+  await post('/api/power/rate', { hz: parseFloat(document.getElementById('rate-select').value) });
+}
+async function setAuto(on) { autoRange=on; setAutoUI(on); await post('/api/power/range', { auto: on }); }
+function setAutoUI(on) {
+  document.getElementById('btn-auto').classList.toggle('active', on);
+  document.getElementById('btn-manual').classList.toggle('active', !on);
+}
+async function doZero() {
+  const d = await post('/api/power/zero', {});
+  if (d.error) showAlert('Zero failed: ' + d.error);
+  else document.getElementById('zero-mag').textContent =
+    'offset ' + (d.magnitude!=null ? d.magnitude.toExponential(3)+' W' : 'set');
+}
+async function clearZero() {
+  await post('/api/power/zero/clear', {});
+  document.getElementById('zero-mag').textContent = 'cleared';
+}
+
+// ── Logging ────────────────────────────────────────────────────────────
+async function startLog() { await fetch('/api/power/log/start',{method:'POST'}); }
+async function stopLog()  { const d=await (await fetch('/api/power/log/stop',{method:'POST'})).json();
+  document.getElementById('log-status').textContent = (d.rows||0)+' rows captured'; }
+function setLogUI(on) {
+  document.getElementById('btn-log-start').disabled = on;
+  document.getElementById('btn-log-stop').disabled = !on;
+  if (on) document.getElementById('log-status').textContent = 'Logging…';
+}
+
+async function cmdReconnect() {
+  setDisconnected('Reconnecting…');
+  await fetch('/api/power/reconnect',{method:'POST'});
+  setTimeout(fetchInfo, 800);
+}
+
+// ── Utilities ──────────────────────────────────────────────────────────
+async function post(url, body) {
+  const r = await fetch(url, { method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify(body) });
+  try { return await r.json(); } catch(e){ return {}; }
+}
+function setConnected(){ document.getElementById('conn-led').className='led green';
+  document.getElementById('conn-text').textContent='Connected'; }
+function setDisconnected(msg){ document.getElementById('conn-led').className='led red';
+  document.getElementById('conn-text').textContent='Disconnected'; if(msg) showAlert(msg); }
+function showAlert(msg){ const el=document.getElementById('alert');
+  el.textContent='⚠ '+msg; el.classList.add('show'); }
+function clearAlert(){ document.getElementById('alert').classList.remove('show'); }
+</script>
+</body>
+</html>

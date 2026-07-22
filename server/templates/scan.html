@@ -1,0 +1,851 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>VSL Scan</title>
+<link rel="icon" type="image/png" href="/static/uah-logo.png">
+<link rel="stylesheet" href="/static/style.css">
+<script src="/static/theme.js"></script>
+<style>
+body{display:flex;flex-direction:column;align-items:center}
+
+main{width:100%;max-width:1100px;padding:20px 24px 60px}
+
+/* Live readouts */
+#hero{display:flex;align-items:flex-end;gap:34px;margin-bottom:14px;flex-wrap:wrap}
+.readout .k{font-size:10px;text-transform:uppercase;letter-spacing:.1em;color:var(--text2)}
+.readout .v{font-family:var(--mono);color:var(--accent);line-height:1.1}
+#r-signal .v{font-size:36px;font-weight:600}
+.readout.small .v{font-size:19px;color:var(--text)}
+#peakbox{margin-left:auto;text-align:right}
+#peakbox .v{color:var(--green)}
+
+#plotwrap{position:relative;height:340px}
+canvas{position:absolute;inset:0;width:100%;height:100%}
+#legend{display:flex;flex-wrap:wrap;gap:14px;margin-top:8px;font-size:11px;color:var(--text2)}
+#legend span{display:flex;align-items:center;gap:6px}
+#legend i{width:14px;height:3px;border-radius:2px;display:inline-block}
+
+#progrow{display:flex;align-items:center;gap:14px;margin-top:14px}
+#prog-msg{font-size:11.5px;color:var(--text2);white-space:nowrap;min-width:180px}
+#prog-count{font-size:12px;font-family:var(--mono);color:var(--text2);white-space:nowrap}
+
+/* Setup grid */
+.setup{display:grid;grid-template-columns:repeat(12,1fr);gap:14px 16px;align-items:end}
+.span2{grid-column:span 2}.span3{grid-column:span 3}.span4{grid-column:span 4}
+.span5{grid-column:span 5}.span6{grid-column:span 6}.span12{grid-column:span 12}
+.hidden{display:none}
+.opts{display:flex;gap:22px;align-items:center}
+.inrow{display:flex;gap:8px}
+.actions{display:flex;gap:10px;align-items:center;margin-top:4px;flex-wrap:wrap}
+
+/* Band rows */
+.bandrow{display:flex;align-items:center;gap:10px;margin-bottom:8px}
+.bandrow .sw{width:13px;height:13px;border-radius:3px;flex-shrink:0}
+.bandrow input{width:110px}
+.bandrow .x{cursor:pointer;color:var(--text3);font-size:16px;padding:0 4px}
+.bandrow .x:hover{color:var(--red)}
+.bandrow .val{font-family:var(--mono);color:var(--text2);font-size:11.5px;margin-left:auto}
+
+#tbl-wrap{max-height:230px;overflow:auto;margin-top:12px}
+details.card>*:not(summary){margin-top:12px}
+details.card .h{flex:1;margin:0}
+</style>
+</head>
+<body>
+
+<header class="app-header">
+  <img src="/static/uah-logo.png" alt="The University of Alabama in Huntsville" class="brand-logo">
+  <div class="header-right">
+    <span class="pill"><span class="led" id="led-act"></span><span id="txt-act">Actuator</span></span>
+    <span class="pill"><span class="led" id="led-det"></span><span id="txt-det">Detector</span></span>
+    <button class="theme-toggle" onclick="toggleTheme()"></button>
+  </div>
+</header>
+
+<main>
+  <div id="alert" class="alert"></div>
+
+  <!-- ── Plot + live readout ─────────────────────────────────────── -->
+  <div class="card">
+    <div id="hero">
+      <div class="readout" id="r-signal"><div class="k">Signal</div><div class="v">—</div></div>
+      <div class="readout small" id="r-setpoint"><div class="k">Setpoint</div><div class="v">—</div></div>
+      <div class="readout small" id="r-pos"><div class="k">Position</div><div class="v">—</div></div>
+      <div class="readout small" id="peakbox"><div class="k">Peak</div><div class="v">—</div></div>
+    </div>
+    <div id="plotwrap"><canvas id="plot"></canvas></div>
+    <div id="legend"></div>
+    <div id="progrow">
+      <span id="prog-msg">Idle</span>
+      <div class="prog-track"><div class="prog-bar" id="prog-bar"></div></div>
+      <span id="prog-count">0 / 0</span>
+    </div>
+  </div>
+
+  <!-- ── Scan setup ──────────────────────────────────────────────── -->
+  <div class="card">
+    <div class="h">Scan</div>
+    <div class="setup">
+      <div class="f span12" id="actuator-row" style="display:none">
+        <label>Actuator</label><div class="seg" id="actuator-seg"></div>
+      </div>
+      <div class="f span4"><label>Axis</label><div class="seg" id="axis-seg"></div></div>
+      <div class="f span2"><label>Start (<span class="u"></span>)</label><input type="number" id="in-start" step="0.1" value="0"></div>
+      <div class="f span2"><label>Stop (<span class="u"></span>)</label><input type="number" id="in-stop" step="0.1" value="0"></div>
+      <div class="f span2"><label>Step (<span class="u"></span>)</label><input type="number" id="in-step" step="0.01" value="1"></div>
+      <div class="f span2"><label>Points</label><input type="number" id="in-nsteps" step="1" min="2" value="2"></div>
+
+      <div class="f span3"><label><span class="hint" title="Wait after each move before measuring">Settle (s)</span></label><input type="number" id="in-settle" step="0.1" min="0" value="1.0"></div>
+      <div class="f span3"><label><span class="hint" title="Measurement window after settle; for spectrometers use at least the integration time">Dwell (s)</span></label><input type="number" id="in-dwell" step="0.1" min="0" value="0.5"></div>
+      <div class="f span6" style="align-self:end">
+        <div class="opts">
+          <label class="chk"><input type="checkbox" id="in-bidir"> Bidirectional</label>
+          <label class="chk"><input type="checkbox" id="in-repeat"> Repeat</label>
+        </div>
+      </div>
+
+      <div class="span12 actions">
+        <button class="btn btn-go" id="btn-start">Start scan</button>
+        <button class="btn btn-stop solid" id="btn-stop" style="display:none">Stop</button>
+        <span id="ready-chip" class="chip" style="display:none">not ready</span>
+        <button class="btn btn-sec btn-sm" id="btn-prepare" style="display:none">Prepare</button>
+        <span style="flex:1"></span>
+        <a class="btn btn-sec btn-sm" id="btn-dl" href="/api/scan/download">Signal CSV</a>
+        <a class="btn btn-sec btn-sm hidden" id="btn-dl-spectra" href="/api/scan/spectra">Spectra CSV</a>
+        <button class="btn btn-sec btn-sm" id="btn-plot"
+                title="Matplotlib figure of the current plot, including any computed overlays">Plot PNG</button>
+        <button class="btn btn-sec btn-sm hidden" id="btn-plot-spectra"
+                title="Wavelength × position intensity map of the captured spectra">Spectra map PNG</button>
+        <button class="btn btn-sec btn-sm" id="btn-clear">Clear</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Detector ────────────────────────────────────────────────── -->
+  <div class="card">
+    <div class="h">Detector</div>
+    <div class="setup">
+      <div class="f span6" id="detector-row" style="display:none">
+        <label>Device</label><div class="seg" id="detector-seg"></div>
+      </div>
+      <div class="f span6" id="metric-row">
+        <label>Signal metric</label><div class="seg" id="metric-seg"></div>
+      </div>
+      <div class="f span3 hidden" id="wl-field"><label>Wavelength λ (nm)</label><input type="number" id="in-atwl" step="1" value="0"></div>
+      <div class="f span3 hidden" id="int-field"><label>Integration (ms)</label>
+        <div class="inrow"><input type="number" id="in-int" step="1" min="0" value="10"><button class="btn btn-sec btn-sm" id="btn-int">Set</button></div></div>
+      <div class="f span2 hidden" id="avg-field"><label>Averages</label>
+        <div class="inrow"><input type="number" id="in-avg" step="1" min="1" value="1"><button class="btn btn-sec btn-sm" id="btn-avg">Set</button></div></div>
+      <div class="f span3 hidden" id="meterwl-field"><label>Meter λ-correction (nm)</label><input type="number" id="in-meterwl" step="1" value="0"></div>
+    </div>
+  </div>
+
+  <!-- ── Manual actuator control (SMC100, when connected) ────────── -->
+  <details class="card" id="smc-card" style="display:none" open>
+    <summary><span class="h">Actuator — manual control</span>
+      <span class="muted" id="smc-state">—</span></summary>
+    <div id="smc-barwrap" style="position:relative;height:22px;background:var(--display-bg);
+         border:1px solid var(--display-brd);border-radius:5px;overflow:hidden;margin-bottom:2px">
+      <div id="smc-bar-fill" style="position:absolute;top:0;left:0;height:100%;width:0%;
+           background:var(--primary);opacity:.7;transition:width .15s"></div>
+      <div id="smc-bar-tgt" style="position:absolute;top:-2px;height:26px;width:2px;
+           background:var(--yellow);transition:left .15s"></div>
+    </div>
+    <div style="display:flex;justify-content:space-between;font-size:10px;color:var(--text3);
+         font-family:var(--mono);margin-bottom:12px">
+      <span id="smc-lim-lo">0 mm</span>
+      <span id="smc-pos" style="color:var(--text2)">— mm</span>
+      <span id="smc-lim-hi">— mm</span>
+    </div>
+    <div class="setup">
+      <div class="f span3"><label>Move to (mm)</label>
+        <div class="inrow"><input type="number" id="smc-in-abs" step="0.001" value="0">
+          <button class="btn btn-go btn-sm" id="smc-btn-abs">Go</button></div></div>
+      <div class="f span3"><label>Jog step (mm)</label>
+        <div class="inrow">
+          <button class="btn btn-sec btn-sm" id="smc-btn-jog-neg" style="font-family:var(--mono)">◀</button>
+          <input type="number" id="smc-in-jog" step="0.001" value="0.1" style="text-align:center">
+          <button class="btn btn-sec btn-sm" id="smc-btn-jog-pos" style="font-family:var(--mono)">▶</button>
+        </div></div>
+      <div class="f span3"><label>Velocity (mm/s) <span class="muted" id="smc-vmax"></span></label>
+        <div class="inrow"><input type="number" id="smc-in-vel" step="0.1" min="0" value="2">
+          <button class="btn btn-sec btn-sm" id="smc-btn-vel">Set</button></div></div>
+      <div class="f span3" style="align-self:end">
+        <div class="inrow">
+          <button class="btn btn-primary btn-sm" id="smc-btn-home"
+                  title="Reference the stage — required after power-on before moves">Home</button>
+          <button class="btn btn-stop solid btn-sm" id="smc-btn-stop">STOP</button>
+        </div></div>
+    </div>
+  </details>
+
+  <!-- ── Wavelength bands (spectrometer only) ────────────────────── -->
+  <details class="card hidden" id="bands-card" open>
+    <summary><span class="h">Wavelength bands</span>
+      <span class="muted hint" title="Integrated area ∫I·dλ within each band, computed from the full spectrum captured at every scan point">∫I·dλ</span></summary>
+    <div id="bands-list"></div>
+    <div class="actions">
+      <button class="btn btn-sec btn-sm" id="btn-band-add">+ Add band</button>
+      <button class="btn btn-primary btn-sm" id="btn-band-compute">Compute &amp; overlay</button>
+      <button class="btn btn-sec btn-sm" id="btn-band-dl">Bands CSV</button>
+    </div>
+  </details>
+
+  <!-- ── Beam profile ────────────────────────────────────────────── -->
+  <details class="card" id="profile-card">
+    <summary><span class="h">Beam profile</span>
+      <span class="muted hint" title="Differentiates a knife-edge scan (greatest rate of change = edge centre) and fits a Gaussian">knife-edge → Gaussian</span></summary>
+    <div class="actions">
+      <button class="btn btn-primary btn-sm" id="btn-profile">Compute &amp; overlay</button>
+      <a class="btn btn-sec btn-sm" id="btn-profile-dl" href="/api/scan/profile/download">Profile CSV</a>
+      <button class="btn btn-sec btn-sm" id="btn-profile-clear">Clear</button>
+    </div>
+    <div id="profile-readout" class="muted">—</div>
+  </details>
+
+  <!-- ── VSL gain ────────────────────────────────────────────────── -->
+  <details class="card" id="vsl-card" open>
+    <summary><span class="h">VSL gain</span>
+      <span class="muted hint" title="Variable stripe length analysis after De Giorgi &amp; Anni (Optical Gain of Lead Halide Perovskites via VSL — What We Can Learn and How to Avoid Pitfalls). Instantaneous gain g_inst(z) = (dI/dz − A_sp)/I(z) is computed live during the scan. Compute gain runs both fits: the cutoff-scan SSG fit of I = (A_sp/g)(e^gz − 1), and the full-curve gain-saturation model dI/dz = A_sp + g0·I/(1 + I/I_s), which yields the unsaturated gain g0 and the saturation intensity I_s.">g<sub>inst</sub>(z) = (dI/dz − A<sub>sp</sub>)/I(z)</span></summary>
+    <div class="setup" style="margin-bottom:10px">
+      <div class="f span3">
+        <label><span class="hint" title="Exclude near-zero noisy data; leave blank to use the first scan point">Min z₀ (<span class="vsl-u"></span>)</span></label>
+        <input type="number" id="in-vsl-z0" step="0.01" placeholder="auto">
+      </div>
+      <div class="f span4" style="align-self:end">
+        <label class="chk"><input type="checkbox" id="in-vsl-live" checked>
+          <span class="hint" title="Recompute and plot g_inst(z) from the growing dataset while the scan runs">Live instantaneous gain</span></label>
+      </div>
+    </div>
+    <div class="actions">
+      <button class="btn btn-primary btn-sm" id="btn-vsl">Compute gain</button>
+      <button class="btn btn-sec btn-sm" id="btn-vsl-dl">Gain CSV</button>
+      <button class="btn btn-sec btn-sm" id="btn-vsl-plot"
+              title="Matplotlib figure of the cutoff scan and instantaneous gain">Gain plot PNG</button>
+      <button class="btn btn-sec btn-sm" id="btn-vsl-clear">Clear</button>
+    </div>
+    <div id="vsl-inst-readout" class="muted">g<sub>inst</sub>: —</div>
+    <div id="vsl-readout" class="muted">—</div>
+    <div id="vsl-plotwrap" style="position:relative;height:200px;display:none">
+      <canvas id="vsl-plot" style="position:absolute;inset:0;width:100%;height:100%"></canvas>
+    </div>
+  </details>
+
+  <!-- ── Results table ───────────────────────────────────────────── -->
+  <details class="card">
+    <summary><span class="h">Data table</span><span class="muted" id="tbl-n">0 points</span></summary>
+    <div id="tbl-wrap">
+      <table>
+        <thead><tr><th>#</th><th>Setpoint</th><th id="th-x">Position</th><th id="th-y">Signal</th><th>± std</th><th>n</th></tr></thead>
+        <tbody id="tbody"></tbody>
+      </table>
+    </div>
+  </details>
+</main>
+
+<script>
+const $=id=>document.getElementById(id);
+async function getJSON(u){const r=await fetch(u);return r.json();}
+async function post(u,b){const r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})});return r.json();}
+async function postBlob(u,b){return fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})});}
+function alertMsg(m,k){const a=$('alert');a.textContent=m;a.className='alert show '+(k||'err');if(k==='ok')setTimeout(()=>a.className='alert',3500);}
+function clearAlert(){$('alert').className='alert';}
+const BAND_COLORS=['#ffd700','#ff9933','#ff5a5a','#b07cff','#3ddc84','#ff7ad9'];
+const MONO='Menlo, Consolas, monospace', SANS='-apple-system, "Segoe UI", sans-serif';
+
+// ── value formatting (power vs counts) ────────────────────────────
+function fmtPower(w){ if(w==null||isNaN(w))return '—'; const a=Math.abs(w); if(a===0)return '0 W';
+  for(const [t,s,u] of [[1e-9,1e12,'pW'],[1e-6,1e9,'nW'],[1e-3,1e6,'µW'],[1,1e3,'mW']]) if(a<t)return (w*s).toPrecision(4)+' '+u;
+  return w.toPrecision(4)+' W'; }
+function siPrefix(a){ if(a>=1e9)return[1e9,'G']; if(a>=1e6)return[1e6,'M']; if(a>=1e3)return[1e3,'k']; return[1,'']; }
+function fmtSignal(v,kind,unit){ if(v==null||isNaN(v))return '—';
+  if(kind==='power')return fmtPower(v);
+  const [d,p]=siPrefix(Math.abs(v)); return (v/d).toPrecision(4)+' '+p+(unit||''); }
+function yAxis(maxAbs,kind,unit){
+  if(kind==='power'){ for(const [t,s,u] of [[1e-9,1e12,'pW'],[1e-6,1e9,'nW'],[1e-3,1e6,'µW'],[1,1e3,'mW']]) if(maxAbs<t)return{f:s,u:u}; return{f:1,u:'W'}; }
+  const [d,p]=siPrefix(maxAbs); return {f:1/d,u:(p+(unit||''))||'counts'}; }
+
+// ── actuator / axis model ─────────────────────────────────────────
+let ACT_ID=null, AXES={}, AXIS=null, POS_UNIT='', ACT_STATUS={}, READYACT={};
+function currentAxis(){ return AXES[AXIS]||null; }
+function renderActuators(list, activeId){
+  const connected=list.filter(a=>a.connected);
+  $('actuator-row').style.display = connected.length>1 ? '' : 'none';
+  const seg=$('actuator-seg');
+  seg.innerHTML=list.map(a=>`<button data-id="${a.id}" class="${a.id===activeId?'on':''}" ${a.connected?'':'disabled'} title="${a.controller}">${a.name}</button>`).join('');
+  seg.querySelectorAll('button').forEach(b=>b.onclick=async()=>{
+    const r=await post('/api/scan/actuator',{id:b.dataset.id}); if(r.error){alertMsg(r.error);return;}
+    ACT_ID=null; pollConfig(); });
+}
+function renderAxes(axes){
+  AXES={}; axes.forEach(a=>AXES[a.key]=a);
+  const pos=axes.find(a=>a.kind==='position'); POS_UNIT=pos?pos.unit:(axes[0]?axes[0].unit:'');
+  $('axis-seg').innerHTML=axes.map(a=>`<button data-axis="${a.key}">${a.label}</button>`).join('');
+  $('axis-seg').querySelectorAll('button').forEach(b=>b.onclick=()=>setAxis(b.dataset.axis));
+  setAxis(axes[0]?axes[0].key:null);
+}
+function setAxis(key){
+  AXIS=key; const ax=currentAxis();
+  $('axis-seg').querySelectorAll('button').forEach(b=>b.classList.toggle('on',b.dataset.axis===key));
+  if(!ax)return;
+  document.querySelectorAll('.u').forEach(e=>e.textContent=ax.unit);
+  document.querySelectorAll('.vsl-u').forEach(e=>e.textContent=ax.unit);
+  $('in-start').value=ax.min; $('in-stop').value=ax.max;
+  $('in-step').value=Math.max(((ax.max-ax.min)/30),0.001).toPrecision(2);
+  $('th-x').textContent=ax.label.replace(/\s*\(.*\)/,'');
+  syncFromStep(); refreshReady();
+}
+function nPoints(){const a=+$('in-start').value,b=+$('in-stop').value,s=+$('in-step').value;
+  let n=s>0?Math.floor(Math.abs(b-a)/s)+1:+$('in-nsteps').value;return Math.max(2,n|0);}
+function syncFromStep(){$('in-nsteps').value=nPoints();}
+function syncFromN(){const a=+$('in-start').value,b=+$('in-stop').value,n=Math.max(2,(+$('in-nsteps').value)|0);
+  $('in-step').value=(Math.abs(b-a)/(n-1)).toPrecision(3);}
+['in-start','in-stop','in-step'].forEach(id=>$(id).oninput=syncFromStep);
+$('in-nsteps').oninput=syncFromN;
+
+// ── detector model ────────────────────────────────────────────────
+let DET_ID=null, DET_KIND='', METRIC='', METRICS=[], WLRANGE=null;
+function renderDetectors(list, activeId){
+  const connected=list.filter(d=>d.connected);
+  $('detector-row').style.display = connected.length>1 ? '' : 'none';
+  const seg=$('detector-seg');
+  seg.innerHTML=list.map(d=>`<button data-id="${d.id}" class="${d.id===activeId?'on':''}" ${d.connected?'':'disabled'} title="${d.kind}">${d.name}</button>`).join('');
+  seg.querySelectorAll('button').forEach(b=>b.onclick=async()=>{
+    const r=await post('/api/scan/detector',{id:b.dataset.id}); if(r.error){alertMsg(r.error);return;}
+    DET_ID=null; pollConfig(); });
+}
+function renderDetector(act, metric, wavelength){
+  // act = active_detector block {id,name,kind,metrics,wavelength_range,acquisition}
+  if(!act){ $('metric-row').style.display='none'; $('bands-card').classList.add('hidden');
+    $('int-field').classList.add('hidden'); $('avg-field').classList.add('hidden');
+    $('wl-field').classList.add('hidden'); $('meterwl-field').classList.add('hidden'); return; }
+  DET_KIND=act.kind; METRICS=act.metrics||[]; WLRANGE=act.wavelength_range; METRIC=metric||(METRICS[0]&&METRICS[0].key);
+  const spec = act.kind==='spectrometer';
+  // metric seg
+  $('metric-row').style.display = METRICS.length>1 ? '' : 'none';
+  $('metric-seg').innerHTML=METRICS.map(m=>`<button data-m="${m.key}" class="${m.key===METRIC?'on':''}">${m.label}</button>`).join('');
+  $('metric-seg').querySelectorAll('button').forEach(b=>b.onclick=()=>setMetric(b.dataset.m));
+  // spectrometer fields
+  $('int-field').classList.toggle('hidden',!spec);
+  $('avg-field').classList.toggle('hidden',!spec);
+  $('bands-card').classList.toggle('hidden',!spec);
+  $('btn-dl-spectra').classList.toggle('hidden',!spec);
+  $('btn-plot-spectra').classList.toggle('hidden',!spec);
+  if(spec && act.acquisition){ if(act.acquisition.integration_ms!=null)$('in-int').value=act.acquisition.integration_ms;
+    if(act.acquisition.averages!=null)$('in-avg').value=act.acquisition.averages; }
+  // power meter wavelength-correction field
+  $('meterwl-field').classList.toggle('hidden',act.kind!=='power');
+  // @λ field
+  if(wavelength!=null && +$('in-atwl').value===0) $('in-atwl').value=wavelength;
+  updateMetricFields();
+}
+function updateMetricFields(){
+  $('wl-field').classList.toggle('hidden', !(DET_KIND==='spectrometer' && METRIC==='at_wavelength'));
+}
+async function setMetric(key){
+  METRIC=key;
+  $('metric-seg').querySelectorAll('button').forEach(b=>b.classList.toggle('on',b.dataset.m===key));
+  updateMetricFields();
+  await post('/api/scan/detector/metric',{metric:key,wavelength:+$('in-atwl').value||null});
+}
+$('in-atwl').onchange=()=>post('/api/scan/detector/metric',{metric:METRIC,wavelength:+$('in-atwl').value});
+$('btn-int').onclick=()=>post('/api/scan/detector/acquire',{integration_ms:+$('in-int').value}).then(r=>r.error?alertMsg(r.error):alertMsg('Integration set','ok'));
+$('btn-avg').onclick=()=>post('/api/scan/detector/acquire',{averages:+$('in-avg').value}).then(r=>r.error?alertMsg(r.error):alertMsg('Averages set','ok'));
+$('in-meterwl').onchange=()=>{const nm=+$('in-meterwl').value;if(nm>0)post('/api/power/wavelength',{wavelength:nm});};
+
+// ── manual SMC actuator control ───────────────────────────────────
+let SMC_ON=false, SMC_INIT=false, SCAN_RUNNING=false;
+function smcShow(on){
+  if(on===SMC_ON) return;
+  SMC_ON=on; $('smc-card').style.display=on?'':'none';
+  if(on&&!SMC_INIT) smcInfo();
+}
+async function smcInfo(){
+  try{
+    const d=await getJSON('/api/smc/info'); const p=d.profile||{};
+    if(p.max_velocity_mm_s){ $('smc-in-vel').max=p.max_velocity_mm_s;
+      $('smc-vmax').textContent='max '+p.max_velocity_mm_s; }
+    if(p.travel_mm){ $('smc-in-abs').max=p.travel_mm; $('smc-in-abs').min=0; }
+    SMC_INIT=true;
+  }catch(e){}
+}
+async function pollSmc(){
+  if(!SMC_ON) return;
+  let s; try{ s=await getJSON('/api/smc/status'); }catch(e){ return; }
+  if(!s.connected){ $('smc-state').textContent='disconnected'; return; }
+  const ref=!!s.referenced, moving=!!s.moving;
+  $('smc-state').textContent=(s.state||'—').toLowerCase()
+    +(SCAN_RUNNING?' · locked by scan':'')
+    +' · target '+(+s.target).toFixed(3)+' mm';
+  $('smc-pos').textContent=(+s.position).toFixed(4)+' mm';
+  const L=s.limits||{min:0,max:50};
+  $('smc-lim-lo').textContent=L.min+' mm'; $('smc-lim-hi').textContent=L.max+' mm';
+  $('smc-bar-fill').style.width=Math.round((s.fraction||0)*1000)/10+'%';
+  $('smc-bar-tgt').style.left=(L.max>L.min?((s.target-L.min)/(L.max-L.min)*100):0)+'%';
+  const lock=moving||SCAN_RUNNING;
+  ['smc-btn-abs','smc-btn-jog-neg','smc-btn-jog-pos'].forEach(id=>$(id).disabled=lock||!ref);
+  $('smc-btn-home').disabled=lock;
+  $('smc-btn-vel').disabled=SCAN_RUNNING;
+  $('smc-btn-home').classList.toggle('btn-go',!ref);      // green = homing needed
+  $('smc-btn-home').classList.toggle('btn-primary',ref);
+}
+setInterval(pollSmc, 500);
+async function smcAct(p,b){ clearAlert(); const r=await post(p,b);
+  if(r.error){alertMsg(r.error);return null;} if(r.warning){alertMsg(r.warning);} return r; }
+$('smc-btn-abs').onclick=()=>smcAct('/api/smc/move',{position:+$('smc-in-abs').value});
+$('smc-btn-jog-neg').onclick=()=>smcAct('/api/smc/move/relative',{delta:-Math.abs(+$('smc-in-jog').value)});
+$('smc-btn-jog-pos').onclick=()=>smcAct('/api/smc/move/relative',{delta:+Math.abs(+$('smc-in-jog').value)});
+$('smc-in-abs').onkeydown=e=>{ if(e.key==='Enter')$('smc-btn-abs').click(); };
+$('smc-btn-vel').onclick=()=>smcAct('/api/smc/velocity',{velocity:+$('smc-in-vel').value})
+  .then(r=>r&&alertMsg('Velocity set to '+r.velocity+' mm/s','ok'));
+$('smc-btn-home').onclick=()=>smcAct('/api/smc/home').then(r=>r&&alertMsg(r.message||'Homing…','ok'));
+$('smc-btn-stop').onclick=()=>post('/api/smc/stop',{});
+
+// ── readiness chip ────────────────────────────────────────────────
+function refreshReady(){
+  const ax=currentAxis(),chip=$('ready-chip'),btn=$('btn-prepare'); const label=ax&&ax.ready_action;
+  if(!label){chip.style.display='none';btn.style.display='none';return;}
+  chip.style.display='';btn.style.display='';btn.textContent=label;
+  if(READYACT.running){chip.className='chip busy';chip.textContent=READYACT.message||'working…';btn.disabled=true;}
+  else if(ACT_STATUS.ready){chip.className='chip ok';chip.textContent='✓ ready';btn.disabled=false;}
+  else{chip.className='chip warn';chip.textContent='not ready';btn.disabled=!ACT_STATUS.connected;}
+}
+$('btn-prepare').onclick=async()=>{clearAlert();const r=await post('/api/scan/prepare',{});if(r.error){alertMsg(r.error);return;}alertMsg(r.message||'Preparing…','ok');};
+
+// ── start / stop / clear ──────────────────────────────────────────
+$('btn-start').onclick=async()=>{
+  clearAlert();
+  const r=await post('/api/scan/start',{ axis:AXIS,
+    start:+$('in-start').value, stop:+$('in-stop').value, step_size:+$('in-step').value,
+    settle_s:+$('in-settle').value, dwell_s:+$('in-dwell').value,
+    bidirectional:$('in-bidir').checked, repeat:$('in-repeat').checked });
+  if(r.error){alertMsg(r.error);return;}
+  BAND_RESULT=null; alertMsg('Scan started — '+r.total+' points.','ok');
+};
+$('btn-stop').onclick=()=>post('/api/scan/stop',{});
+$('btn-clear').onclick=()=>{POINTS=[];BAND_RESULT=null;PROFILE=null;$('profile-readout').textContent='—';drawPlot();$('tbody').innerHTML='';$('tbl-n').textContent='0 points';$('prog-count').textContent='0 / 0';};
+
+// ── matplotlib figure export ──────────────────────────────────────
+async function dlPlot(url){
+  clearAlert();
+  const r=await fetch(url);
+  if(!r.ok){ let e=null; try{ e=(await r.json()).error; }catch(_){}
+    alertMsg(e||'Plot export failed'); return; }
+  // honour the server's filename if present
+  const cd=r.headers.get('Content-Disposition')||'';
+  const m=cd.match(/filename=([^;]+)/);
+  const blob=await r.blob(), u=URL.createObjectURL(blob), a=document.createElement('a');
+  a.href=u; a.download=m?m[1].trim():'plot.png'; a.click(); URL.revokeObjectURL(u);
+}
+function scanPlotURL(){
+  // mirror whatever overlays are currently computed on the web plot
+  const q=[];
+  if(BAND_RESULT&&BAND_RESULT.bands.length)
+    q.push('bands='+BAND_RESULT.bands.map(b=>b.lo+':'+b.hi).join(','));
+  if(PROFILE) q.push('profile=1');
+  if(VSL_RESULT){ q.push('vsl=1'); const z0=vslZ0(); if(z0!==null)q.push('z0='+z0); }
+  return '/api/scan/plot'+(q.length?'?'+q.join('&'):'');
+}
+$('btn-plot').onclick=()=>dlPlot(scanPlotURL());
+$('btn-plot-spectra').onclick=()=>dlPlot('/api/scan/spectra/plot');
+$('btn-vsl-plot').onclick=()=>{ const z0=vslZ0();
+  dlPlot('/api/scan/vsl/plot'+(z0!==null?'?z0='+z0:'')); };
+
+// ── band post-processing ──────────────────────────────────────────
+let BANDS=[{lo:'',hi:''}], BAND_RESULT=null;
+function renderBands(){
+  $('bands-list').innerHTML=BANDS.map((b,i)=>{
+    const c=BAND_COLORS[i%BAND_COLORS.length];
+    const v=BAND_RESULT&&BAND_RESULT.bands[i]?(' '+fmtSignal(lastVal(BAND_RESULT.bands[i].values),'counts',BAND_RESULT.unit)+' @ end'):'';
+    return `<div class="bandrow"><span class="sw" style="background:${c}"></span>`+
+      `<input type="number" data-i="${i}" data-k="lo" placeholder="λ low"  value="${b.lo}">`+
+      `<span class="muted">–</span>`+
+      `<input type="number" data-i="${i}" data-k="hi" placeholder="λ high" value="${b.hi}">`+
+      `<span class="muted">nm</span><span class="x" data-rm="${i}">×</span><span class="val">${v}</span></div>`;}).join('');
+  $('bands-list').querySelectorAll('input').forEach(inp=>inp.onchange=()=>{
+    BANDS[+inp.dataset.i][inp.dataset.k]=inp.value; });
+  $('bands-list').querySelectorAll('.x').forEach(x=>x.onclick=()=>{ BANDS.splice(+x.dataset.rm,1); if(!BANDS.length)BANDS=[{lo:'',hi:''}]; renderBands(); });
+}
+function lastVal(arr){ for(let i=arr.length-1;i>=0;i--) if(arr[i]!=null) return arr[i]; return null; }
+$('btn-band-add').onclick=()=>{ BANDS.push({lo:'',hi:''}); renderBands(); };
+function bandPayload(){ return BANDS.filter(b=>b.lo!==''&&b.hi!=='').map(b=>[+b.lo,+b.hi]); }
+$('btn-band-compute').onclick=async()=>{
+  clearAlert(); const bands=bandPayload();
+  if(!bands.length){alertMsg('Add at least one band (λ low / λ high).');return;}
+  const r=await post('/api/scan/bands',{bands});
+  if(r.error){alertMsg(r.error);return;}
+  BAND_RESULT=r; renderBands(); drawPlot();
+  alertMsg('Computed '+r.bands.length+' band(s).','ok');
+};
+$('btn-band-dl').onclick=async()=>{
+  const bands=bandPayload(); if(!bands.length){alertMsg('Add at least one band.');return;}
+  const resp=await postBlob('/api/scan/bands/download',{bands});
+  if(!resp.ok){alertMsg('No spectra captured yet.');return;}
+  const blob=await resp.blob(), url=URL.createObjectURL(blob), a=document.createElement('a');
+  a.href=url; a.download='bands.csv'; a.click(); URL.revokeObjectURL(url);
+};
+
+// ── knife-edge beam profile ───────────────────────────────────────
+let PROFILE=null;
+$('btn-profile').onclick=async()=>{
+  clearAlert();
+  const r=await fetch('/api/scan/profile').then(x=>x.json());
+  if(r.error){alertMsg(r.error);return;}
+  PROFILE=r; drawPlot();
+  const g=r.gaussian, ms=r.max_slope, xu=X_UNIT||'';
+  if(g){
+    $('profile-readout').innerHTML=
+      '<b style="color:var(--orange)">Gaussian</b> &nbsp; centre <b>'+(+g.center).toFixed(3)+' '+xu+'</b>'+
+      ' &nbsp; FWHM <b>'+(+g.fwhm).toFixed(3)+' '+xu+'</b>'+
+      ' &nbsp; σ '+(+g.sigma).toFixed(3)+' '+xu+
+      ' &nbsp;·&nbsp; max slope @ <b>'+(+ms.x).toFixed(3)+' '+xu+'</b>';
+    alertMsg('Beam profile fitted — FWHM '+(+g.fwhm).toFixed(3)+' '+xu+'.','ok');
+  }else{
+    $('profile-readout').innerHTML='Derivative computed, but no Gaussian fit '+
+      '(scan may not be edge-shaped). Max slope @ <b>'+(+ms.x).toFixed(3)+' '+xu+'</b>.';
+    alertMsg('No Gaussian fit — is the scan a knife-edge (rising/falling) curve?');
+  }
+};
+$('btn-profile-clear').onclick=()=>{ PROFILE=null; $('profile-readout').textContent='—'; drawPlot(); };
+
+// ── polling ───────────────────────────────────────────────────────
+let POINTS=[], X_UNIT='', X_LABEL='Position', Y_LABEL='Signal', Y_UNIT='', Y_KIND='';
+function setLed(led,txt,ok,label,err){$(led).className='led '+(ok?(/OVER|SAT/.test(label)?'orange':'green'):'red');
+  $(txt).textContent=label;$(txt).title=err||'';}
+
+async function pollConfig(){
+  try{ const c=await getJSON('/api/scan/config');
+    renderActuators(c.actuators||[], c.active?c.active.id:null);
+    smcShow((c.actuators||[]).some(a=>a.id==='smc100'&&a.connected));
+    if(c.active && c.active.id!==ACT_ID){ ACT_ID=c.active.id; renderAxes(c.active.axes||[]); }
+    if(!c.active){ ACT_ID=null; $('axis-seg').innerHTML='<button disabled>no actuator connected</button>'; }
+    renderDetectors(c.detectors||[], c.active_detector?c.active_detector.id:null);
+    const ad=c.active_detector;
+    if(ad && ad.id!==DET_ID){ DET_ID=ad.id; renderDetector(ad, c.metric, c.wavelength); }
+    else if(ad){ DET_KIND=ad.kind; }   // keep current
+    if(!ad){ DET_ID=null; renderDetector(null); }
+    if(c.power && c.power.wavelength && +$('in-meterwl').value===0) $('in-meterwl').value=c.power.wavelength;
+  }catch(e){}
+}
+async function pollScan(){
+  try{ const s=await getJSON('/api/scan/status');
+    SCAN_RUNNING=!!s.running;
+    ACT_STATUS=s.actuator_status||{}; READYACT=s.ready_action||{};
+    const an=$('actuator-seg').querySelector('button.on');
+    setLed('led-act','txt-act',ACT_STATUS.connected, an?an.textContent:'Actuator', ACT_STATUS.error);
+    if(ACT_STATUS.position!=null) $('r-pos').querySelector('.v').textContent=(+ACT_STATUS.position).toFixed(4)+' '+POS_UNIT;
+    const ds=s.detector_status||{};
+    const dn=$('detector-seg').querySelector('button.on');
+    setLed('led-det','txt-det',ds.connected, dn?dn.textContent:'Detector', ds.error);
+    $('r-signal').querySelector('.k').textContent=ds.label||'Signal';
+    $('r-signal').querySelector('.v').textContent=fmtSignal(ds.value, ds.y_kind, ds.unit);
+    $('th-y').textContent=ds.label||'Signal';
+    $('r-setpoint').querySelector('.v').textContent = s.current_setpoint==null?'—':s.current_setpoint+' '+(s.x_unit||'');
+    $('prog-count').textContent=(s.done||0)+' / '+(s.total||0);
+    $('prog-msg').textContent=s.message||(s.running?'Scanning…':'Idle');
+    $('prog-bar').style.width=(s.total?Math.round(100*(s.done||0)/s.total):0)+'%';
+    $('btn-start').style.display=s.running?'none':'inline-flex';
+    $('btn-stop').style.display =s.running?'inline-flex':'none';
+    if(READYACT.error) alertMsg(READYACT.error);
+    refreshReady();
+  }catch(e){}
+}
+async function pollData(){
+  try{ const d=await getJSON('/api/scan/data'); POINTS=d.points||[];
+    X_UNIT=d.x_unit||X_UNIT; X_LABEL=d.x_label||X_LABEL;
+    Y_LABEL=d.y_label||Y_LABEL; Y_UNIT=d.y_unit||''; Y_KIND=d.y_kind||'';
+    drawPlot(); fillTable();
+  }catch(e){}
+}
+function fillTable(){
+  $('tbl-n').textContent=POINTS.length+' points';
+  $('tbody').innerHTML=POINTS.slice(-600).map(p=>
+    `<tr><td>${p.i}</td><td>${(+p.setpoint).toFixed(4)}</td><td>${(+p.x).toFixed(4)}</td><td>${fmtSignal(p.value,Y_KIND,Y_UNIT)}</td><td>${fmtSignal(p.std,Y_KIND,Y_UNIT)}</td><td>${p.n}</td></tr>`).join('');
+}
+
+// ── plot ──────────────────────────────────────────────────────────
+const cv=$('plot'), ctx=cv.getContext('2d');
+function sizeCanvas(){const d=window.devicePixelRatio||1,w=cv.clientWidth,h=cv.clientHeight;
+  cv.width=w*d;cv.height=h*d;ctx.setTransform(d,0,0,d,0,0);return[w,h];}
+function niceStep(r,t){const raw=r/t,mag=Math.pow(10,Math.floor(Math.log10(raw))),n=raw/mag,m=n<1.5?1:n<3?2:n<7?5:10;return m*mag;}
+function drawPlot(){
+  const [W,H]=sizeCanvas(); ctx.clearRect(0,0,W,H);
+  const C={frame:cssVar('--plot-frame'),grid:cssVar('--plot-grid'),tick:cssVar('--plot-tick'),
+    label:cssVar('--plot-label'),line:cssVar('--plot-line'),marker:cssVar('--plot-marker'),
+    green:cssVar('--green'),orange:cssVar('--orange'),yellow:cssVar('--yellow'),
+    accent:cssVar('--accent'),text3:cssVar('--text3')};
+  const padL=70,padR=18,padT=14,padB=42, x0=padL,x1=W-padR,y0=H-padB,y1=padT;
+  ctx.strokeStyle=C.frame; ctx.lineWidth=1; ctx.strokeRect(x0,y1,x1-x0,y0-y1);
+  $('legend').innerHTML='';
+  if(POINTS.length<1){ ctx.fillStyle=C.text3; ctx.font='13px '+SANS; ctx.textAlign='center';
+    ctx.fillText('No data yet — set parameters and press Start.',(x0+x1)/2,(y0+y1)/2); $('peakbox').querySelector('.v').textContent='—'; return; }
+  const xs=POINTS.map(p=>p.x), vs=POINTS.map(p=>p.value);
+  let xmin=Math.min(...xs),xmax=Math.max(...xs),pmin=Math.min(...vs,0),pmax=Math.max(...vs);
+  // include band overlays in y-range
+  const overlays=(BAND_RESULT&&BAND_RESULT.bands)?BAND_RESULT.bands:[];
+  overlays.forEach(b=>b.values.forEach(v=>{ if(v!=null){ if(v>pmax)pmax=v; if(v<pmin)pmin=v; }}));
+  if(xmin===xmax)xmax=xmin+1; if(pmin===pmax)pmax=pmin+(Math.abs(pmin)||1)*.1+1e-12;
+  const ax=yAxis(Math.max(Math.abs(pmin),Math.abs(pmax)),Y_KIND,Y_UNIT);
+  const xR=xmax-xmin,yR=pmax-pmin, sx=v=>x0+(v-xmin)/xR*(x1-x0), sy=v=>y0-(v-pmin)/yR*(y0-y1);
+  ctx.font='11px '+MONO; ctx.lineWidth=1;
+  ctx.textAlign='center'; ctx.textBaseline='top'; const xstep=niceStep(xR,6);
+  for(let v=Math.ceil(xmin/xstep)*xstep; v<=xmax+1e-9; v+=xstep){
+    ctx.strokeStyle=C.grid; ctx.beginPath(); ctx.moveTo(sx(v),y1); ctx.lineTo(sx(v),y0); ctx.stroke();
+    ctx.fillStyle=C.tick; ctx.fillText(v.toFixed(xR<5?2:1),sx(v),y0+6); }
+  ctx.textAlign='right'; ctx.textBaseline='middle'; const ystep=niceStep(yR,5);
+  for(let v=Math.ceil(pmin/ystep)*ystep; v<=pmax+1e-9; v+=ystep){
+    ctx.strokeStyle=C.grid; ctx.beginPath(); ctx.moveTo(x0,sy(v)); ctx.lineTo(x1,sy(v)); ctx.stroke();
+    ctx.fillStyle=C.tick; ctx.fillText((v*ax.f).toPrecision(3),x0-6,sy(v)); }
+  ctx.fillStyle=C.label; ctx.font='11px '+SANS; ctx.textAlign='center'; ctx.textBaseline='bottom';
+  ctx.fillText(X_LABEL,(x0+x1)/2,H-6);
+  ctx.save(); ctx.translate(16,(y0+y1)/2); ctx.rotate(-Math.PI/2); ctx.textBaseline='top';
+  ctx.fillText(Y_LABEL+' ('+ax.u+')',0,0); ctx.restore();
+  // main curve
+  ctx.strokeStyle=C.line; ctx.lineWidth=1.7; ctx.beginPath();
+  POINTS.forEach((p,i)=>{const X=sx(p.x),Y=sy(p.value); i?ctx.lineTo(X,Y):ctx.moveTo(X,Y);}); ctx.stroke();
+  ctx.fillStyle=C.marker; POINTS.forEach(p=>{ctx.beginPath();ctx.arc(sx(p.x),sy(p.value),2.4,0,7);ctx.fill();});
+  // band overlays
+  overlays.forEach((b,bi)=>{ const c=BAND_COLORS[bi%BAND_COLORS.length]; ctx.strokeStyle=c; ctx.lineWidth=1.4; ctx.beginPath();
+    let started=false;
+    b.values.forEach((v,i)=>{ if(v==null)return; const X=sx(BAND_RESULT.x[i]),Y=sy(v); started?ctx.lineTo(X,Y):ctx.moveTo(X,Y); started=true; });
+    ctx.stroke(); });
+  // knife-edge profile overlay (normalized into the plot; own units)
+  if(PROFILE){
+    const dxs=PROFILE.deriv_x, dys=PROFILE.deriv_y, g=PROFILE.gaussian;
+    let dmax=0; dys.forEach(v=>{const a=Math.abs(v); if(a>dmax)dmax=a;});
+    if(g) dmax=Math.max(dmax,g.amplitude); if(dmax<=0)dmax=1;
+    const ny=v=>sy(pmin+(Math.abs(v)/dmax)*(pmax-pmin));
+    ctx.strokeStyle=C.orange; ctx.lineWidth=1.3; ctx.setLineDash([4,3]); ctx.beginPath();
+    dxs.forEach((x,i)=>{const X=sx(x),Y=ny(dys[i]); i?ctx.lineTo(X,Y):ctx.moveTo(X,Y);});
+    ctx.stroke(); ctx.setLineDash([]);
+    if(g){
+      ctx.strokeStyle=C.yellow; ctx.lineWidth=1.8; ctx.beginPath();
+      g.curve_x.forEach((x,i)=>{const X=sx(x),Y=ny(g.curve_y[i]); i?ctx.lineTo(X,Y):ctx.moveTo(X,Y);});
+      ctx.stroke();
+      ctx.strokeStyle=C.yellow; ctx.setLineDash([2,3]); ctx.beginPath();
+      ctx.moveTo(sx(g.center),y0); ctx.lineTo(sx(g.center),y1); ctx.stroke(); ctx.setLineDash([]);
+    }
+  }
+  // VSL fitted SSG model overlay (clipped to plot box so the diverging tail doesn't bleed out)
+  if(VSL_RESULT && VSL_RESULT.curve_z){
+    ctx.save();
+    ctx.beginPath(); ctx.rect(x0,y1,x1-x0,y0-y1); ctx.clip();
+    ctx.strokeStyle=C.accent; ctx.lineWidth=1.6; ctx.setLineDash([5,3]); ctx.beginPath();
+    VSL_RESULT.curve_z.forEach((z,i)=>{const X=sx(z),Y=sy(VSL_RESULT.curve_I[i]); i?ctx.lineTo(X,Y):ctx.moveTo(X,Y);});
+    ctx.stroke(); ctx.setLineDash([]);
+    // gain-saturation model I(z) — follows the data through the bend
+    if(VSL_RESULT.sat && VSL_RESULT.sat.curve_z){
+      ctx.strokeStyle='#8a63d2'; ctx.lineWidth=1.6; ctx.setLineDash([7,3,2,3]); ctx.beginPath();
+      VSL_RESULT.sat.curve_z.forEach((z,i)=>{const X=sx(z),Y=sy(VSL_RESULT.sat.curve_I[i]); i?ctx.lineTo(X,Y):ctx.moveTo(X,Y);});
+      ctx.stroke(); ctx.setLineDash([]);
+    }
+    ctx.restore();
+    ctx.strokeStyle=C.green; ctx.lineWidth=1; ctx.setLineDash([3,4]); ctx.beginPath();
+    ctx.moveTo(sx(VSL_RESULT.z_sat),y0); ctx.lineTo(sx(VSL_RESULT.z_sat),y1); ctx.stroke(); ctx.setLineDash([]);
+  }
+  // legend
+  let leg='<span><i style="background:'+C.line+'"></i>'+Y_LABEL+'</span>';
+  overlays.forEach((b,bi)=>{ leg+='<span><i style="background:'+BAND_COLORS[bi%BAND_COLORS.length]+'"></i>'+b.label+'</span>'; });
+  if(PROFILE){ leg+='<span><i style="background:'+C.orange+'"></i>d(signal)/dx</span>';
+    if(PROFILE.gaussian) leg+='<span><i style="background:'+C.yellow+'"></i>Gaussian fit (normalised)</span>'; }
+  if(VSL_RESULT){ leg+='<span><i style="background:'+C.accent+'"></i>SSG fit (g='+VSL_RESULT.best_g.toFixed(3)+' 1/'+(VSL_RESULT.x_unit||'')+') </span>';
+    if(VSL_RESULT.sat) leg+='<span><i style="background:#8a63d2"></i>saturation model (g₀='+VSL_RESULT.sat.g0.toFixed(3)+' 1/'+(VSL_RESULT.x_unit||'')+')</span>'; }
+  $('legend').innerHTML=leg;
+  // peak of main curve
+  const peak=POINTS.reduce((a,b)=>b.value>a.value?b:a,POINTS[0]);
+  ctx.strokeStyle=C.green; ctx.setLineDash([4,3]); ctx.beginPath(); ctx.moveTo(sx(peak.x),y0); ctx.lineTo(sx(peak.x),y1); ctx.stroke(); ctx.setLineDash([]);
+  $('peakbox').querySelector('.v').textContent=fmtSignal(peak.value,Y_KIND,Y_UNIT)+' @ '+(+peak.x).toFixed(2)+' '+X_UNIT;
+}
+window.addEventListener('resize',()=>{drawPlot();drawVslPlot();});
+window.addEventListener('themechange',()=>{drawPlot();drawVslPlot();});
+
+// ── VSL gain analysis ─────────────────────────────────────────────
+let VSL_RESULT=null, INST_RESULT=null, INST_N=0;
+const vcv=$('vsl-plot'), vctx=vcv?vcv.getContext('2d'):null;
+
+function vslZ0(){const v=+$('in-vsl-z0').value; return ($('in-vsl-z0').value===''||isNaN(v))?null:v;}
+
+// Live instantaneous gain g_inst(z) = (dI/dz − A_sp)/I(z) — refreshed while
+// the scan acquires (De Giorgi & Anni VSL method).
+async function pollInstant(){
+  if(!$('in-vsl-live').checked || POINTS.length<5) return;
+  if(POINTS.length===INST_N && !(VSL_RESULT===null&&INST_RESULT===null)) return;  // nothing new
+  INST_N=POINTS.length;
+  const z0=vslZ0();
+  try{
+    const r=await fetch('/api/scan/vsl/instant'+(z0!==null?'?z0='+z0:'')).then(x=>x.json());
+    if(r.error) return;
+    INST_RESULT=r;
+    const xu=r.x_unit||'';
+    $('vsl-inst-readout').innerHTML=
+      'g<sub>inst</sub> plateau ≈ <b style="color:var(--orange)">'+r.g0.toFixed(4)+'</b> 1/'+xu+
+      ' &nbsp; A<sub>sp</sub> ≈ '+(+r.A_sp).toExponential(2)+
+      ' &nbsp; <span class="muted">'+r.n+' pts'+(r.running?' · live':'')+'</span>';
+    $('vsl-plotwrap').style.display='';
+    drawVslPlot();
+  }catch(e){}
+}
+setInterval(pollInstant, 1200);
+
+$('btn-vsl').onclick=async()=>{
+  clearAlert();
+  const z0=vslZ0();
+  const url='/api/scan/vsl'+(z0!==null?'?z0='+z0:'');
+  const r=await fetch(url).then(x=>x.json());
+  if(r.error){alertMsg(r.error);return;}
+  VSL_RESULT=r;
+  if(r.inst){ INST_RESULT={...r.inst, x_unit:r.x_unit};
+    $('vsl-inst-readout').innerHTML=
+      'g<sub>inst</sub> plateau ≈ <b style="color:var(--orange)">'+r.inst.g0.toFixed(4)+'</b> 1/'+(r.x_unit||'')+
+      ' &nbsp; <span class="muted">(A<sub>sp</sub> from fit)</span>'; }
+  const xu=r.x_unit||'', g=r.best_g, ci=r.best_ci95, zs=r.z_sat;
+  const cmNote=(xu==='mm')?' &nbsp;·&nbsp; <span class="muted">×10 → '+(g*10).toFixed(2)+' cm⁻¹</span>':'';
+  let html=
+    '<b style="color:var(--accent)">g</b> = <b>'+g.toFixed(5)+'</b> 1/'+xu+
+    ' &nbsp; ±'+ci.toFixed(5)+' (95% CI)'+
+    ' &nbsp; z<sub>sat</sub> ≈ <b>'+zs.toFixed(3)+' '+xu+'</b>'+
+    ' &nbsp; A<sub>sp</sub> = '+r.A_sp.toExponential(3)+cmNote;
+  if(r.sat){
+    const zi=r.sat.z_sat!=null?(+r.sat.z_sat).toFixed(3)+' '+xu:'not reached';
+    html+='<br><b style="color:#8a63d2">saturation model</b> &nbsp; '+
+      'g₀ = <b>'+r.sat.g0.toFixed(5)+'</b> 1/'+xu+
+      ' &nbsp; I<sub>s</sub> = '+fmtSignal(r.sat.I_s,Y_KIND,Y_UNIT)+
+      ' &nbsp; z(I=I<sub>s</sub>) = '+zi+
+      ' &nbsp; R² = '+r.sat.r2;
+  }
+  $('vsl-readout').innerHTML=html;
+  $('vsl-plotwrap').style.display='';
+  requestAnimationFrame(()=>requestAnimationFrame(drawVslPlot));
+  drawPlot();
+  alertMsg('VSL gain g = '+g.toFixed(5)+' 1/'+xu+' ±'+ci.toFixed(5),'ok');
+};
+
+$('btn-vsl-clear').onclick=()=>{
+  VSL_RESULT=null; INST_RESULT=null; INST_N=0;
+  $('vsl-readout').textContent='—';
+  $('vsl-inst-readout').innerHTML='g<sub>inst</sub>: —';
+  $('vsl-plotwrap').style.display='none'; drawPlot();
+};
+
+$('btn-vsl-dl').onclick=async()=>{
+  const z0=vslZ0();
+  const url='/api/scan/vsl/download'+(z0!==null?'?z0='+z0:'');
+  const resp=await fetch(url);
+  if(!resp.ok){alertMsg('Run VSL gain analysis first.');return;}
+  const blob=await resp.blob(),burl=URL.createObjectURL(blob),a=document.createElement('a');
+  a.href=burl; a.download='vsl_gain.csv'; a.click(); URL.revokeObjectURL(burl);
+};
+
+function drawVslPlot(){
+  if(!vcv||!vctx)return;
+  const scan=(VSL_RESULT&&VSL_RESULT.scan)||[];
+  const inst=(INST_RESULT&&INST_RESULT.g_inst&&INST_RESULT.g_inst.length)?INST_RESULT:null;
+  if(!scan.length&&!inst)return;
+  const C={frame:cssVar('--plot-frame'),grid:cssVar('--plot-grid'),tick:cssVar('--plot-tick'),
+    label:cssVar('--plot-label'),accent:cssVar('--accent'),green:cssVar('--green'),
+    yellow:cssVar('--yellow'),orange:cssVar('--orange')};
+  const d=window.devicePixelRatio||1, W=vcv.offsetWidth||600, H=vcv.offsetHeight||200;
+  vcv.width=W*d; vcv.height=H*d; vctx.setTransform(d,0,0,d,0,0);
+  vctx.clearRect(0,0,W,H);
+  const pL=64,pR=16,pT=12,pB=36, x0=pL,x1=W-pR,y0=H-pB,y1=pT;
+  vctx.strokeStyle=C.frame; vctx.lineWidth=1; vctx.strokeRect(x0,y1,x1-x0,y0-y1);
+
+  // Combined ranges over all curves (all in g vs stripe length z)
+  const sat=(VSL_RESULT&&VSL_RESULT.sat&&VSL_RESULT.sat.curve_g)?VSL_RESULT.sat:null;
+  let xsAll=[], ysAll=[0];
+  scan.forEach(s=>{ xsAll.push(s.z_fit); ysAll.push(s.g-(s.ci95||0), s.g+(s.ci95||0)); });
+  if(inst){ xsAll=xsAll.concat(inst.z); ysAll=ysAll.concat(inst.g_inst); }
+  if(sat){ xsAll=xsAll.concat(sat.curve_z); ysAll=ysAll.concat(sat.curve_g); }
+  const xmin=Math.min(...xsAll), xmax=Math.max(...xsAll);
+  const ymin=Math.min(...ysAll), ymax=Math.max(...ysAll,1e-9);
+  if(xmax===xmin||ymax===ymin)return;
+  const xR=xmax-xmin, yR=ymax-ymin;
+  const sx=v=>x0+(v-xmin)/xR*(x1-x0), sy=v=>y0-(v-ymin)/yR*(y0-y1);
+
+  vctx.font='10px '+MONO; vctx.lineWidth=1;
+  const xst=niceStep(xR,5); vctx.textAlign='center'; vctx.textBaseline='top';
+  for(let v=Math.ceil(xmin/xst)*xst; v<=xmax+1e-9; v+=xst){
+    vctx.strokeStyle=C.grid; vctx.beginPath(); vctx.moveTo(sx(v),y1); vctx.lineTo(sx(v),y0); vctx.stroke();
+    vctx.fillStyle=C.tick; vctx.fillText(v.toPrecision(3),sx(v),y0+4);}
+  const yst=niceStep(yR,4); vctx.textAlign='right'; vctx.textBaseline='middle';
+  for(let v=Math.ceil(ymin/yst)*yst; v<=ymax+1e-9; v+=yst){
+    vctx.strokeStyle=C.grid; vctx.beginPath(); vctx.moveTo(x0,sy(v)); vctx.lineTo(x1,sy(v)); vctx.stroke();
+    vctx.fillStyle=C.tick; vctx.fillText(v.toPrecision(3),x0-4,sy(v));}
+
+  const xu=(VSL_RESULT&&VSL_RESULT.x_unit)||(inst&&inst.x_unit)||X_UNIT||'';
+  vctx.fillStyle=C.label; vctx.font='10px '+SANS;
+  vctx.textAlign='center'; vctx.textBaseline='bottom';
+  vctx.fillText('stripe length z ('+xu+')',(x0+x1)/2,H-2);
+  vctx.save(); vctx.translate(12,(y0+y1)/2); vctx.rotate(-Math.PI/2);
+  vctx.textBaseline='top'; vctx.fillText('g (1/'+xu+')',0,0); vctx.restore();
+
+  if(scan.length){
+    // CI shaded band
+    vctx.fillStyle='rgba(128,170,210,0.12)'; vctx.beginPath();
+    scan.forEach((s,i)=>{const X=sx(s.z_fit),Y=sy(s.g+(s.ci95||0)); i?vctx.lineTo(X,Y):vctx.moveTo(X,Y);});
+    scan.slice().reverse().forEach(s=>vctx.lineTo(sx(s.z_fit),sy(s.g-(s.ci95||0))));
+    vctx.closePath(); vctx.fill();
+    // cutoff-scan g curve
+    vctx.strokeStyle=C.accent; vctx.lineWidth=1.6; vctx.beginPath();
+    scan.forEach((s,i)=>{const X=sx(s.z_fit),Y=sy(s.g); i?vctx.lineTo(X,Y):vctx.moveTo(X,Y);}); vctx.stroke();
+  }
+
+  // gain-saturation model local gain g(z)=g0/(1+I/I_s) — smooth reference
+  if(sat){
+    vctx.strokeStyle='#8a63d2'; vctx.lineWidth=1.6; vctx.beginPath();
+    sat.curve_z.forEach((z,i)=>{const X=sx(z),Y=sy(sat.curve_g[i]); i?vctx.lineTo(X,Y):vctx.moveTo(X,Y);});
+    vctx.stroke();
+    vctx.font='10px '+MONO; vctx.fillStyle='#8a63d2';
+    vctx.textAlign='left'; vctx.textBaseline='top';
+    vctx.fillText('g0='+sat.g0.toFixed(3),x0+4,sy(sat.g0)+3);
+    if(sat.z_sat!=null){
+      vctx.setLineDash([6,3,2,3]); vctx.beginPath();
+      vctx.moveTo(sx(sat.z_sat),y1); vctx.lineTo(sx(sat.z_sat),y0); vctx.stroke();
+      vctx.setLineDash([]);
+    }
+  }
+
+  // instantaneous gain g_inst(z)
+  if(inst){
+    vctx.strokeStyle=C.orange; vctx.lineWidth=1.3; vctx.beginPath();
+    inst.z.forEach((z,i)=>{const X=sx(z),Y=sy(inst.g_inst[i]); i?vctx.lineTo(X,Y):vctx.moveTo(X,Y);});
+    vctx.stroke();
+    vctx.fillStyle=C.orange;
+    inst.z.forEach((z,i)=>{vctx.beginPath();vctx.arc(sx(z),sy(inst.g_inst[i]),2,0,7);vctx.fill();});
+    // g0 plateau line
+    vctx.strokeStyle=C.orange; vctx.lineWidth=1; vctx.setLineDash([2,4]);
+    vctx.beginPath(); vctx.moveTo(x0,sy(inst.g0)); vctx.lineTo(x1,sy(inst.g0)); vctx.stroke();
+    vctx.setLineDash([]);
+    vctx.font='10px '+MONO; vctx.fillStyle=C.orange;
+    vctx.textAlign='right'; vctx.textBaseline='bottom';
+    vctx.fillText('g_inst='+inst.g0.toFixed(3),x1-4,sy(inst.g0)-2);
+  }
+
+  if(VSL_RESULT){
+    // horizontal dashed line at best_g
+    vctx.strokeStyle=C.yellow; vctx.lineWidth=1; vctx.setLineDash([4,3]);
+    vctx.beginPath(); vctx.moveTo(x0,sy(VSL_RESULT.best_g)); vctx.lineTo(x1,sy(VSL_RESULT.best_g)); vctx.stroke();
+    // vertical dashed line at z_sat
+    vctx.strokeStyle=C.green; vctx.beginPath();
+    vctx.moveTo(sx(VSL_RESULT.z_sat),y1); vctx.lineTo(sx(VSL_RESULT.z_sat),y0); vctx.stroke();
+    vctx.setLineDash([]);
+    vctx.font='10px '+MONO; vctx.fillStyle=C.yellow;
+    vctx.textAlign='left'; vctx.textBaseline='bottom';
+    vctx.fillText('g='+VSL_RESULT.best_g.toFixed(4),x0+4,sy(VSL_RESULT.best_g)-2);
+    vctx.fillStyle=C.green; vctx.textBaseline='top';
+    const zsx=sx(VSL_RESULT.z_sat);
+    vctx.fillText('z_sat='+VSL_RESULT.z_sat.toFixed(3),Math.min(zsx+3,x1-70),y1+2);
+  }
+}
+
+// ── boot ──────────────────────────────────────────────────────────
+renderBands();
+pollConfig(); pollScan(); pollData();
+setInterval(pollScan,400);
+setInterval(pollData,800);
+setInterval(pollConfig,5000);
+</script>
+</body>
+</html>
