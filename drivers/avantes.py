@@ -91,13 +91,22 @@ def _candidate_lib_paths() -> list[str]:
                   "/usr/local/lib/libavs.dylib",
                   "/opt/homebrew/lib/libavs.dylib"]
     elif sys.platform.startswith("linux"):
-        paths += [os.path.join(vend, "libavs.so"),
+        # amd64 and arm64 builds are both vendored under their own filename
+        # (a single repo checkout is shared across coworkers on either kind
+        # of Linux box) — whichever doesn't match this machine's
+        # architecture just fails to load below and we fall through to the
+        # next candidate, same as the multiple Windows DLL names above.
+        paths += [os.path.join(vend, "libavs.so.amd64"),
+                  os.path.join(vend, "libavs.so.arm64"),
+                  os.path.join(vend, "libavs.so"),
                   os.path.join(vend, "libavs.so.0"),
                   "/usr/local/lib/libavs.so.0", "/usr/local/lib/libavs.so",
                   "/usr/lib/libavs.so.0"]
     else:  # win32
         paths += [os.path.join(vend, "avaspecx64.dll"),
                   os.path.join(vend, "avaspec.dll"),
+                  os.path.join(vend, "avaspec_production_x64.dll"),
+                  os.path.join(vend, "avaspec_production.dll"),
                   "avaspecx64.dll", "avaspec.dll"]
     return paths
 
