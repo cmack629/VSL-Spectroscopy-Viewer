@@ -199,10 +199,17 @@ def spectra_map_figure(wl, specs, xs, meta):
     return fig
 
 
-def spectrum_figure(wl, inten, title, subtitle="", peak_wl=None, sat_level=None):
+def spectrum_figure(wl, inten, title, subtitle="", peak_wl=None, sat_level=None,
+                    log_scale=False):
     """Single spectrum (live spectrometer view)."""
     fig, ax = new_figure(8.0, 4.5)
-    ax.plot(wl, inten, "-", lw=0.9, color=LINE)
+    if log_scale:
+        positive = [(x, y) for x, y in zip(wl, inten) if y > 0]
+        if positive:
+            ax.plot(*zip(*positive), "-", lw=0.9, color=LINE)
+            ax.set_yscale("log")
+    else:
+        ax.plot(wl, inten, "-", lw=0.9, color=LINE)
     if peak_wl is not None:
         ax.axvline(peak_wl, color=GREEN, lw=0.9, ls="--",
                    label=f"peak {peak_wl:.1f} nm")
@@ -210,7 +217,8 @@ def spectrum_figure(wl, inten, title, subtitle="", peak_wl=None, sat_level=None)
     if sat_level is not None and inten and max(inten) > 0.8 * sat_level:
         ax.axhline(sat_level, color="#d94f4f", lw=0.8, ls=":")
     ax.set_xlabel("Wavelength (nm)", fontsize=10)
-    ax.set_ylabel("Intensity (counts)", fontsize=10)
+    ax.set_ylabel("Intensity (counts, log scale)" if log_scale else "Intensity (counts)",
+                  fontsize=10)
     ax.set_title(title + (f"\n{subtitle}" if subtitle else ""), fontsize=11)
     ax.margins(x=0)
     return fig

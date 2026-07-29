@@ -346,9 +346,11 @@ def api_plot():
     if not inten or len(_wavelengths) != len(inten):
         return jsonify({"error": "No spectrum acquired yet"}), 404
     sub = f"integration {(it or 0) / 1000:.2f} ms · {navg or 1}× averaged"
+    log_scale = request.args.get("log", "").lower() in ("1", "true", "yes")
     fig = plots.spectrum_figure(_wavelengths, inten,
                                 f"HR4000 spectrum — S/N {_spec.serial}",
-                                subtitle=sub, peak_wl=peak_wl, sat_level=sat)
+                                subtitle=sub, peak_wl=peak_wl, sat_level=sat,
+                                log_scale=log_scale)
     return plots.respond(fig, "hr4000")
 
 
