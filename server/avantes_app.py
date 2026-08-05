@@ -7,8 +7,10 @@ publishes the latest spectrum; Flask handlers read that snapshot and queue
 control commands (integration time, averaging, smoothing, dark) onto the sampler
 thread so all device I/O stays single-threaded.
 
-Runs natively (the Avantes lib is loaded by drivers/avantes.py). NOT wired into
-the merged scanner — run it on its own:
+Runs natively (the Avantes lib is loaded by drivers/avantes.py). It IS also
+registered as a selectable detector in the merged scanner (see
+server/detectors.py), so it does not need to be running for scans on port 5050
+to use the Avantes unit. Run it on its own for a dedicated live-spectrum viewer:
 
     python -m server.avantes_app    →  http://localhost:5005
 
@@ -134,27 +136,23 @@ def wavelengths() -> list:
     return list(_wavelengths)
 
 
-def _trapz_area(y, wl, lo=None, hi=None) -> float:
-    """Trapezoidal integral ∫ y dλ over pixels whose λ is within [lo, hi]."""
-    total = 0.0
+def _sum_counts(y, wl, lo=None, hi=None) -> float:
+    """Sum counts for pixels whose wavelength is within [lo, hi]."""
     n = min(len(y), len(wl))
-    for i in range(n - 1):
-        x0, x1 = wl[i], wl[i + 1]
-        if lo is not None and (x0 < lo or x1 < lo):
-            continue
-        if hi is not None and (x0 > hi or x1 > hi):
-            continue
-        total += (x1 - x0) * (y[i] + y[i + 1]) * 0.5
-    return total
+    return sum(y[i] for i in range(n)
+               if (lo is None or wl[i] >= lo) and (hi is None or wl[i] <= hi))
 
 
 def _metric_value(d: dict, metric: str, wl_target):
     inten = d.get("intensities")
     if not inten:
         return None
-    if metric in ("area", "total"):                 # integrated area over all λ
-        return _trapz_area(inten, _wavelengths)
+    if metric in ("area", "total"):                 # summed counts over all λ
+        return _sum_counts(inten, _wavelengths)
     if metric == "at_wavelength" and wl_target is not None and _wavelengths:
+        if isinstance(wl_target, (tuple, list)) and len(wl_target) == 2:
+            lo, hi = sorted(wl_target)              # band sum, not a single pixel
+            return _sum_counts(inten, _wavelengths, lo, hi)
         idx = min(range(len(_wavelengths)),
                   key=lambda i: abs(_wavelengths[i] - wl_target))
         return inten[idx] if idx < len(inten) else None
@@ -353,6 +351,28 @@ def api_plot():
                                 subtitle=sub, peak_wl=peak, sat_level=sat,
                                 log_scale=log_scale)
     return plots.respond(fig, "avantes")
+
+
+@av_bp.route("/export")
+def api_export():
+    """Download the latest spectrum data and plot in one timestamped ZIP."""
+    from server import plots
+    if _spec is None:
+        return jsonify({"error": "Not connected"}), 503
+    with _latest_lock:
+        inten = list(_latest.get("intensities", []))
+        peak = _latest.get("peak_wavelength")
+        it = _latest.get("integration_time_ms")
+        navg = _latest.get("n_averaged")
+        sat = _latest.get("max_counts")
+    files = {"spectrum.csv": api_save().get_data(as_text=True)}
+    if plots.MPL_OK and inten and len(_wavelengths) == len(inten):
+        sub = f"integration {it or 0:.2f} ms · {navg or 1}× averaged"
+        fig = plots.spectrum_figure(_wavelengths, inten,
+                                    f"Avantes {_spec.line.name} — S/N {_spec.serial}",
+                                    subtitle=sub, peak_wl=peak, sat_level=sat)
+        files["spectrum_plot.png"] = plots.figure_bytes(fig)
+    return plots.zip_response(files, "avantes_export")
 
 
 @av_bp.route("/reconnect", methods=["POST"])

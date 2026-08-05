@@ -103,12 +103,12 @@ class PowerDetector(Detector):
 # Spectrometer detectors (HR4000 / Avantes share one adapter)
 # ---------------------------------------------------------------------------
 
-# Default metric is the integrated area over ALL wavelengths (∫ I dλ). Per-band
-# integrated areas are computed in post-processing (see scanner /api/scan/bands).
+# Default metric is the sum of counts over ALL wavelengths. Per-band count sums
+# are computed in post-processing (see scanner /api/scan/bands).
 _SPECTRO_METRICS = [
-    {"key": "area", "label": "Integrated area (all λ)", "unit": "counts·nm"},
+    {"key": "area", "label": "Summed counts (all λ)", "unit": "counts"},
     {"key": "peak", "label": "Peak intensity", "unit": "counts"},
-    {"key": "at_wavelength", "label": "Intensity @ λ", "unit": "counts"},
+    {"key": "at_wavelength", "label": "Intensity @ λ / band", "unit": "counts"},
 ]
 
 

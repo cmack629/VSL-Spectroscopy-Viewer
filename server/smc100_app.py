@@ -28,6 +28,7 @@ smc_bp = Blueprint("smc", __name__)
 
 _smc: SMC100 | None = None
 _smc_lock = threading.Lock()
+_home_lock = threading.Lock()
 _connect_error: str = ""
 _profile = LTA_HS
 _limits = (0.0, LTA_HS.travel_mm)
@@ -144,8 +145,16 @@ def start_home() -> tuple[bool, str]:
     global _home_state
     if _smc is None:
         return False, "SMC100 not connected"
-    _home_state = {"running": True, "ready": False, "error": "",
-                   "message": "Home search in progress…"}
+    with _home_lock:
+        if _scan_busy:
+            return False, "Stage is locked by a scan"
+        if _home_state["running"]:
+            return False, "Home search already in progress"
+        with _smc_lock:
+            if _smc.get_status().is_moving:
+                return False, "Stage is moving"
+        _home_state = {"running": True, "ready": False, "error": "",
+                       "message": "Home search in progress…"}
 
     def _run():
         try:
@@ -356,19 +365,9 @@ def api_home():
     """Execute a home search (OR). Non-blocking; poll status for READY."""
     if _smc is None:
         return jsonify({"error": "Not connected"}), 503
-    busy = _busy_error()
-    if busy:
-        return busy
-    try:
-        with _smc_lock:
-            st = _smc.get_status()
-            if st.state == SMCState.DISABLE:
-                _smc.set_enabled(True)
-                time.sleep(0.2)
-            _smc.home()
-    except Exception as exc:
-        return jsonify({"error": str(exc)}), 500
-    return jsonify({"ok": True, "message": "Home search started…"})
+    ok, message = start_home()
+    return (jsonify({"ok": True, "message": message}) if ok
+            else (jsonify({"error": message}), 409))
 
 
 @smc_bp.route("/stop", methods=["POST"])

@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import threading
 
-from server import app as piezo
+from server import piezo as piezo
 from server import smc100_app as smc
 
 

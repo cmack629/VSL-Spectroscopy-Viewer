@@ -6,6 +6,7 @@
 <title>Power Meter — VSL Scan</title>
 <link rel="stylesheet" href="/static/style.css">
 <script src="/static/theme.js"></script>
+<script src="/static/standalone-nav.js" defer></script>
 <style>
 #app { display:flex; flex-direction:column; height:100%; min-height:100vh; }
 
@@ -64,6 +65,8 @@ select { background:var(--surface); border:1px solid var(--border2); border-radi
   <div id="alert"></div>
 
   <header class="app-header">
+    <img src="/static/United_States_Army_Space_and_Missile_Defense_Command_Logo.svg"
+         alt="United States Army Space and Missile Defense Command" class="brand-logo">
     <span class="wordmark">Thorlabs <span id="hdr-model">PM400</span><small>optical power meter</small></span>
     <nav class="app-nav">
       <a href="/">Scan</a>
@@ -228,9 +231,7 @@ select { background:var(--surface); border:1px solid var(--border2); border-radi
         <h3 style="margin-bottom:0">Data Logging</h3>
         <button class="btn btn-success" id="btn-log-start" onclick="startLog()">Start log</button>
         <button class="btn btn-danger"  id="btn-log-stop"  onclick="stopLog()" disabled>Stop</button>
-        <a class="btn btn-accent" id="btn-log-dl" href="/api/power/log/download">Download CSV</a>
-        <a class="btn btn-sec" id="btn-plot" href="/api/power/plot"
-           title="Matplotlib figure of the power-vs-time chart">Plot PNG</a>
+        <a class="btn btn-accent" href="/api/power/export">Download ZIP</a>
         <span style="margin-left:auto;font-size:11px;color:var(--text2)" id="log-status">Idle</span>
       </div>
 

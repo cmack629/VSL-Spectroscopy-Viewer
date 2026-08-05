@@ -124,7 +124,7 @@ h3, .h {
   flex-shrink: 0;
 }
 .app-header .brand-logo {
-  height: 32px; display: block;
+  width: 28px; height: 36px; display: block; object-fit: contain;
 }
 
 .app-header .wordmark {

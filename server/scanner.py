@@ -28,12 +28,13 @@ Run (from the repo root):  python run.py   →  http://localhost:5050
 import csv
 import io
 import math
+import statistics
 import threading
 import time
 
 from flask import Flask, jsonify, render_template, request, Response
 
-from server import app as piezo            # piezo blueprint
+from server import piezo as piezo            # piezo blueprint
 from server import power_monitor as power  # power blueprint
 from server import smc100_app as smc       # SMC100 blueprint
 from server import hr4000_app as hr        # HR4000 blueprint
@@ -67,20 +68,249 @@ _abort = threading.Event()
 # Current detector-signal selection (also used between scans for the live readout)
 _sel_metric: str = "power"
 _sel_wavelength = None
+_sel_band_width = 0.0    # nm; 0 = single nearest pixel, >0 = sum over a band
 
 
-def _trapz_area(y, wl, lo=None, hi=None) -> float:
-    """Trapezoidal integral ∫ y dλ over pixels whose λ is within [lo, hi]."""
-    total = 0.0
+def _wl_arg():
+    """Value passed to Detector.measure/live for the "at_wavelength" metric:
+    a bare wavelength (nearest pixel, legacy behavior) or a (lo, hi) band
+    tuple centered on it when a band width has been selected."""
+    if _sel_wavelength is None:
+        return None
+    if _sel_band_width and _sel_band_width > 0:
+        half = _sel_band_width / 2.0
+        return (_sel_wavelength - half, _sel_wavelength + half)
+    return _sel_wavelength
+
+
+def _sum_counts(y, wl, lo=None, hi=None) -> float:
+    """Sum counts for pixels whose wavelength is within [lo, hi]."""
     n = min(len(y), len(wl))
-    for i in range(n - 1):
-        x0, x1 = wl[i], wl[i + 1]
-        if lo is not None and (x0 < lo or x1 < lo):
-            continue
-        if hi is not None and (x0 > hi or x1 > hi):
-            continue
-        total += (x1 - x0) * (y[i] + y[i + 1]) * 0.5
-    return total
+    return sum(y[i] for i in range(n)
+               if (lo is None or wl[i] >= lo) and (hi is None or wl[i] <= hi))
+
+
+def _median(values):
+    """Return the median without adding a numerical dependency."""
+    ordered = sorted(values)
+    n = len(ordered)
+    if not n:
+        return None
+    middle = n // 2
+    return ordered[middle] if n % 2 else (ordered[middle - 1] + ordered[middle]) / 2.0
+
+
+def _fit_weights(stds):
+    """
+    Convert per-point std into normalized inverse-variance weights (1/std²)
+    for weighted least squares. A point with no usable std (0, None, or a
+    single-sample point with nothing to compute variance from) falls back to
+    the median of the *other* points' std rather than getting an unbounded
+    weight — otherwise one falsely "perfect" zero-noise point would dominate
+    the fit completely.
+    """
+    pos = [s for s in stds if s and s > 0]
+    fallback = _median(pos) if pos else None
+    out = []
+    for s in stds:
+        eff = s if (s and s > 0) else fallback
+        out.append(1.0 / (eff * eff) if eff else 1.0)
+    return out
+
+
+def _mean_spectrum(spectra):
+    """Elementwise mean of several same-shaped spectra (pixel-by-pixel)."""
+    spectra = [s for s in spectra if s]
+    if not spectra:
+        return None
+    n = min(len(s) for s in spectra)
+    if n == 0:
+        return None
+    return [sum(s[i] for s in spectra) / len(spectra) for i in range(n)]
+
+
+def _measure_averaged(det, metric, wavelength, dwell_s, n_samples,
+                      outlier_sigma=3.0, reject_outliers=True):
+    """
+    Software-side signal averaging: take n_samples independent detector reads
+    at the current (already-settled) position and reduce them to one point's
+    statistics, instead of recording a single exposure.
+
+    Design choice — full-length repeats, not a split dwell_s:
+    Each read runs the detector's *entire* dwell_s window rather than
+    dividing dwell_s into n_samples shorter sub-windows. Two detector-specific
+    reasons drive this:
+      * The power-meter path (power_monitor.collect_average) already averages
+        many hardware samples internally over its dwell_s window; shrinking
+        that window per read would shrink its own sample count too (and can
+        degrade all the way to its n=1 fallback), making the averaging THAT
+        layer already does worse in exchange for reads at this outer layer.
+      * The spectrometer path (collect_metric) waits dwell_s for a freshly
+        settled frame sized against the configured integration_ms × averages;
+        a shorter sub-window risks not containing any settled frame at all.
+    Independent full-length reads instead capture exactly the noise this
+    feature is meant to catch — shot noise, stage micro-jitter, and
+    cosmic-ray-like transients between reads — without shrinking any single
+    read's own internal integration. The tradeoff is time: a scan point now
+    takes roughly n_samples × dwell_s instead of dwell_s.
+
+    Returns the same {value, std, vmin, vmax, n, unit, spectrum, ...} shape as
+    Detector.measure(), with std/vmin/vmax/n now computed from real repeated
+    reads, or None if no read succeeded.
+    """
+    reads = []
+    for _ in range(max(1, int(n_samples))):
+        if _abort.is_set():
+            break
+        m = det.measure(metric, wavelength, dwell_s)
+        if m is not None:
+            reads.append(m)
+    if not reads:
+        return None
+
+    vals = [r["value"] for r in reads]
+    keep_idx = list(range(len(vals)))
+    n_rejected = 0
+    if reject_outliers and len(vals) >= 3:
+        # Median/MAD rather than mean/stdev: a single extreme spike among a
+        # handful of reads drags a plain mean+stdev z-score up enough that
+        # the spike ends up within its own inflated threshold (it can't see
+        # itself as an outlier). The median and MAD stay anchored to the
+        # good reads, so the spike is correctly flagged as far away.
+        med = _median(vals)
+        mad = _median([abs(v - med) for v in vals]) or 0.0
+        robust_std = 1.4826 * mad         # consistent estimator for normal noise
+        if robust_std > 0:
+            filtered = [i for i in keep_idx
+                       if abs(vals[i] - med) <= outlier_sigma * robust_std]
+            if len(filtered) >= 2:            # never reject down to <2 samples
+                n_rejected = len(keep_idx) - len(filtered)
+                keep_idx = filtered
+
+    kept_vals = [vals[i] for i in keep_idx]
+    mean = statistics.fmean(kept_vals)
+    std = statistics.stdev(kept_vals) if len(kept_vals) > 1 else 0.0
+    vmin, vmax = min(kept_vals), max(kept_vals)
+
+    spectrum = _mean_spectrum([reads[i].get("spectrum") for i in keep_idx])
+    peak_wavelength = reads[keep_idx[-1]].get("peak_wavelength")
+    unit = reads[0].get("unit", "")
+
+    return {"value": mean, "std": std, "vmin": vmin, "vmax": vmax,
+            "n": len(kept_vals), "n_rejected": n_rejected, "unit": unit,
+            "spectrum": spectrum, "peak_wavelength": peak_wavelength}
+
+
+def _spectral_vsl_analysis(xs, spectra, wavelengths, manual_band=None):
+    """Analyze a spectrometer VSL scan using its changing emission feature.
+
+    The full-spectrum sum can be dominated by fixed background. This routine
+    identifies the wavelength with the largest low-to-high stripe increase,
+    unless a manual band is supplied. It then subtracts the shortest-stripe
+    median and fits ln(net signal) over the rising, pre-plateau region.
+    """
+    pairs = sorted((float(x), spectrum) for x, spectrum in zip(xs, spectra)
+                   if spectrum)
+    n = len(pairs)
+    pixels = min([len(wavelengths)] + [len(spectrum) for _, spectrum in pairs])
+    if n < 8 or pixels < 3:
+        return None
+
+    xs = [x for x, _ in pairs]
+    spectra = [spectrum[:pixels] for _, spectrum in pairs]
+    baseline_n = max(4, min(20, n // 4))
+    baseline_spectrum = [_median([spectrum[i] for spectrum in spectra[:baseline_n]])
+                         for i in range(pixels)]
+    high_spectrum = [_median([spectrum[i] for spectrum in spectra[-baseline_n:]])
+                     for i in range(pixels)]
+    changes = [high - base for high, base in zip(high_spectrum, baseline_spectrum)]
+    peak_index = max(range(pixels), key=lambda i: changes[i])
+    if manual_band is None:
+        if changes[peak_index] <= 0:
+            return None
+        peak_wavelength = wavelengths[peak_index]
+        band_indices = [i for i in range(pixels)
+                        if abs(wavelengths[i] - peak_wavelength) <= 5.0]
+        band_source = "automatic"
+    else:
+        lo, hi = sorted(manual_band)
+        band_indices = [i for i in range(pixels) if lo <= wavelengths[i] <= hi]
+        if not band_indices:
+            return None
+        peak_wavelength = wavelengths[peak_index]
+        band_source = "manual"
+    raw_band = [sum(spectrum[i] for i in band_indices) for spectrum in spectra]
+    baseline = _median(raw_band[:baseline_n])
+    net_band = [max(0.0, value - baseline) for value in raw_band]
+    peak_net = max(net_band)
+    if peak_net <= 0:
+        return None
+
+    # Keep the middle of the rise: above the noise floor and below plateau.
+    # Use the longest contiguous run in-range, not first-to-last match, so a
+    # single noise spike in the flat baseline can't stretch the fit window
+    # across the whole scan.
+    lo_level, hi_level = peak_net * 0.05, peak_net * 0.75
+    in_range = [lo_level <= value <= hi_level for value in net_band]
+    runs = []
+    run_start = None
+    for i, ok in enumerate(in_range):
+        if ok and run_start is None:
+            run_start = i
+        elif not ok and run_start is not None:
+            runs.append((run_start, i - 1))
+            run_start = None
+    if run_start is not None:
+        runs.append((run_start, len(in_range) - 1))
+    runs = [r for r in runs if r[1] - r[0] + 1 >= 6]
+    if not runs:
+        return None
+    fit_start, fit_end = max(runs, key=lambda r: r[1] - r[0])
+    fit_x = xs[fit_start:fit_end + 1]
+    fit_y = net_band[fit_start:fit_end + 1]
+    if len(fit_x) < 6 or any(value <= 0 for value in fit_y):
+        return None
+
+    log_y = [math.log(value) for value in fit_y]
+    mean_x, mean_y = sum(fit_x) / len(fit_x), sum(log_y) / len(log_y)
+    sxx = sum((x - mean_x) ** 2 for x in fit_x)
+    if sxx <= 0:
+        return None
+    gain = sum((x - mean_x) * (y - mean_y) for x, y in zip(fit_x, log_y)) / sxx
+    intercept = mean_y - gain * mean_x
+    predicted_log = [intercept + gain * x for x in fit_x]
+    rss = sum((y - predicted) ** 2 for y, predicted in zip(log_y, predicted_log))
+    tss = sum((y - mean_y) ** 2 for y in log_y)
+    r2 = 1.0 - rss / tss if tss > 0 else 0.0
+    gain_ci95 = _t95(len(fit_x) - 2) * math.sqrt(rss / (len(fit_x) - 2) / sxx)
+    fit_curve = [math.exp(intercept + gain * x) for x in fit_x]
+
+    warnings = [
+        f"Baseline is the median of the shortest {baseline_n} stripe lengths; "
+        "confirm it with a pump-blocked background measurement.",
+    ]
+    if r2 < 0.9:
+        warnings.append("The selected rise is not strongly exponential; treat the gain as provisional.")
+    if gain <= 0:
+        warnings.append("The selected rise does not show positive optical gain.")
+
+    return {
+        "mode": "spectral_auto",
+        "best_g": gain,
+        "best_ci95": gain_ci95,
+        "r2": r2,
+        "band": {"lo": wavelengths[band_indices[0]], "hi": wavelengths[band_indices[-1]],
+                 "peak": peak_wavelength, "pixels": len(band_indices), "source": band_source},
+        "baseline": baseline,
+        "baseline_points": baseline_n,
+        "fit_range": {"lo": fit_x[0], "hi": fit_x[-1], "n": len(fit_x)},
+        "z": xs,
+        "raw_band": raw_band,
+        "net_band": net_band,
+        "fit_z": fit_x,
+        "fit_signal": fit_curve,
+        "warnings": warnings,
+    }
 
 
 def _solve3(M, r):
@@ -176,6 +406,22 @@ def _t95(df):
     return table[keys[-1]]
 
 
+def _vsl_baseline(zs, Is):
+    """
+    Non-ASE background offset (stray/ambient light, detector dark counts, PL
+    from the unpumped stripe) to subtract before fitting I(z) = A_sp·h(z,g).
+
+    I(z) is physically non-decreasing with stripe length z, so the median of
+    the shortest-stripe quarter is a robust baseline estimate — mirrors the
+    background subtraction already done in _spectral_vsl_analysis. Left in,
+    a large z-independent offset dominates the SSG residuals and the
+    golden-section search on g collapses to its lower bound instead of
+    finding the real gain.
+    """
+    k = max(3, len(Is) // 4)
+    return _median(Is[:k])
+
+
 def _ssg_h(z, g):
     """h(z,g) = (e^{gz}-1)/g, with L'Hôpital limit z at g→0."""
     if abs(g) < 1e-9:
@@ -192,27 +438,37 @@ def _ssg_dhg(z, g):
     return (z * eg * g - (eg - 1.0)) / (g * g)
 
 
-def _fit_ssg(zs, Is):
+def _fit_ssg(zs, Is, weights=None):
     """
     Fit I_ASE(z) = A_sp · h(z,g) to (zs, Is).
 
     A_sp is eliminated analytically (linear in h for fixed g); g is found by
     golden-section search over [g_lo, g_hi].  Returns {g, A_sp, ci95, rss}
     or None if the fit is degenerate.
+
+    weights: optional per-point inverse-variance weights (1/std², see
+    _fit_weights) for a calibrated weighted least-squares fit. When given,
+    the reported CI uses the (JᵀWJ)⁻¹ covariance directly, since real σ_i
+    from repeated measurements are already an absolute noise estimate — no
+    further residual-based rescaling. When None (no real per-point noise
+    estimate available), this is plain OLS and the noise variance is
+    estimated from the fit residuals themselves (sigma² = RSS/df), exactly
+    as before averaging existed.
     """
     n = len(zs)
     if n < 4:
         return None
+    w = weights if weights is not None else [1.0] * n
 
     def a_from_g(g):
         hs = [_ssg_h(z, g) for z in zs]
-        sh2 = sum(h * h for h in hs)
-        if not math.isfinite(sh2) or sh2 < 1e-100:
+        swh2 = sum(wi * h * h for wi, h in zip(w, hs))
+        if not math.isfinite(swh2) or swh2 < 1e-100:
             return None, hs
-        num = sum(I * h for I, h in zip(Is, hs))
+        num = sum(wi * I * h for wi, I, h in zip(w, Is, hs))
         if not math.isfinite(num):
             return None, hs
-        return num / sh2, hs
+        return num / swh2, hs
 
     def rss_g(g):
         if g <= 1e-9:
@@ -220,7 +476,7 @@ def _fit_ssg(zs, Is):
         A, hs = a_from_g(g)
         if A is None or not math.isfinite(A) or A <= 0:
             return float("inf")
-        r = sum((I - A * h) ** 2 for I, h in zip(Is, hs))
+        r = sum(wi * (I - A * h) ** 2 for wi, I, h in zip(w, Is, hs))
         return r if math.isfinite(r) else float("inf")
 
     z_span = zs[-1] - zs[0]
@@ -251,56 +507,118 @@ def _fit_ssg(zs, Is):
             break
     g_opt = (a + b) * 0.5
 
+    # A g_opt pinned against either search bound means the golden-section
+    # search never found an interior minimum (e.g. residual dominated by an
+    # un-subtracted baseline, or a genuinely non-exponential rise) — report
+    # that as a failed fit rather than the boundary value.
+    if g_opt <= g_lo * 1.001 or g_opt >= g_hi * 0.999:
+        return None
+
     A_opt, hs = a_from_g(g_opt)
     if A_opt is None or A_opt <= 0:
         return None
 
-    rss_val = sum((I - A_opt * h) ** 2 for I, h in zip(Is, hs))
+    rss_val = sum(wi * (I - A_opt * h) ** 2 for wi, I, h in zip(w, Is, hs))
     df = n - 2
-    sigma2 = rss_val / max(df, 1)
 
     # Jacobian: J[:,0]=∂I/∂g, J[:,1]=∂I/∂A_sp
     J_g = [A_opt * _ssg_dhg(z, g_opt) for z in zs]
-    J00 = sum(jg * jg for jg in J_g)
-    J01 = sum(jg * h for jg, h in zip(J_g, hs))
-    J11 = sum(h * h for h in hs)
+    J00 = sum(wi * jg * jg for wi, jg in zip(w, J_g))
+    J01 = sum(wi * jg * h for wi, jg, h in zip(w, J_g, hs))
+    J11 = sum(wi * h * h for wi, h in zip(w, hs))
     det = J00 * J11 - J01 * J01
     if det < 1e-300:
         return None
-    var_g = sigma2 * J11 / det
+    if weights is None:
+        sigma2 = rss_val / max(df, 1)
+        var_g = sigma2 * J11 / det
+    else:
+        var_g = J11 / det          # calibrated weights ⇒ no residual rescale
     if var_g <= 0:
         return {"g": g_opt, "A_sp": A_opt, "ci95": float("inf"), "rss": rss_val}
     ci95 = _t95(df) * math.sqrt(var_g)
     return {"g": g_opt, "A_sp": A_opt, "ci95": ci95, "rss": rss_val}
 
 
-def _vsl_gain(xs, ys, z0=None):
+def _vsl_auto_z0(zs, Is):
+    """
+    Auto-detect where the stripe actually starts amplifying, so the cutoff
+    scan doesn't spend its early z_fit range fitting flat pre-onset
+    baseline/noise (Alvarado-Leaños et al., Fig 3b, fit z0 right at the
+    stripe origin — a knife-edge/motorized VSL scan can carry extra travel
+    before the pump stripe reaches the sample edge). Falls back to the first
+    data point if no clear onset is found.
+    """
+    n = len(Is)
+    if n < 8:
+        return zs[0]
+    k = max(3, n // 4)
+    base = Is[:k]
+    baseline = _median(base)
+    mad = _median([abs(v - baseline) for v in base]) or 0.0
+    noise = 1.4826 * mad
+    i_max = max(Is)
+    # Onset threshold is noise-based; the fraction-of-max floor (for
+    # near-noiseless data where MAD≈0) must stay tiny — ASE rises over
+    # decades, so even 5 % of max can land deep inside the exponential and
+    # bias the fitted g high while shrinking its CI.
+    thresh = baseline + max(5.0 * noise, 0.005 * (i_max - baseline))
+    win = 3
+    for i in range(n - win + 1):
+        if all(Is[i + j] >= thresh for j in range(win)):
+            # Walk back to where the signal first cleared the noise band so
+            # the fit keeps the earliest genuine rise — that region carries
+            # most of the exponential's curvature information.
+            lo = baseline + 2.0 * noise
+            while i > 0 and Is[i - 1] > lo:
+                i -= 1
+            return zs[i]
+    return zs[0]
+
+
+def _vsl_gain(xs, ys, z0=None, stds=None):
     """
     VSL scanning-cutoff SSG gain analysis (Fig 3b style from the paper).
 
     For each z_fit cutoff, fits I_ASE = (A_sp/g)(e^{gz}−1) to data [z0, z_fit].
     Returns the g-vs-z_fit stability curve and the best estimate at minimum CI.
+
+    stds: optional per-point measurement std (from repeated-sample averaging,
+    see _measure_averaged). When any point has a real (>0) std, the SSG fits
+    are weighted by 1/std² (see _fit_ssg) instead of treating every point as
+    equally certain. Falls back to plain OLS when no real std is available
+    (e.g. samples_per_point=1 or legacy data).
     """
     n = min(len(xs), len(ys))
     if n < 5:
         return None
+    stds_use = list(stds[:n]) if stds is not None else [0.0] * n
 
-    pairs = sorted(zip(xs[:n], ys[:n]))
-    all_z = [p[0] for p in pairs]
-    all_I = [p[1] for p in pairs]
+    triples = sorted(zip(xs[:n], ys[:n], stds_use))
+    all_z = [t[0] for t in triples]
+    all_I = [t[1] for t in triples]
+    all_s = [t[2] for t in triples]
 
     if z0 is None:
-        z0 = all_z[0]
+        z0 = _vsl_auto_z0(all_z, all_I)
 
-    filt = [(z, I) for z, I in zip(all_z, all_I) if z >= z0 - 1e-12]
+    filt = [(z, I, s) for z, I, s in zip(all_z, all_I, all_s) if z >= z0 - 1e-12]
     if len(filt) < 5:
         return None
     zs = [p[0] for p in filt]
     Is = [p[1] for p in filt]
+    Ss = [p[2] for p in filt]
+
+    baseline = _vsl_baseline(zs, Is)
+    Is = [I - baseline for I in Is]
+
+    have_real_std = any(s and s > 0 for s in Ss)
+    weights_full = _fit_weights(Ss) if have_real_std else None
 
     scan = []
     for end_idx in range(3, len(zs)):
-        fit = _fit_ssg(zs[: end_idx + 1], Is[: end_idx + 1])
+        w_seg = weights_full[: end_idx + 1] if weights_full is not None else None
+        fit = _fit_ssg(zs[: end_idx + 1], Is[: end_idx + 1], weights=w_seg)
         if fit is None:
             continue
         if not math.isfinite(fit["g"]):
@@ -324,7 +642,8 @@ def _vsl_gain(xs, ys, z0=None):
     g_b, A_b = best["g"], best["A_sp"]
     z_range = zs[-1] - zs[0]
     curve_z = [zs[0] + z_range * i / 200 for i in range(201)]
-    curve_I = [A_b * _ssg_h(z, g_b) for z in curve_z]
+    # Add the baseline back so the curve overlays correctly on the raw signal
+    curve_I = [baseline + A_b * _ssg_h(z, g_b) for z in curve_z]
 
     return {
         "scan": scan,
@@ -332,9 +651,11 @@ def _vsl_gain(xs, ys, z0=None):
         "best_ci95": best["ci95"],
         "z_sat": best["z_fit"],
         "A_sp": best["A_sp"],
+        "baseline": round(baseline, 6),
         "curve_z": curve_z,
         "curve_I": curve_I,
         "z0": z0,
+        "weighted": have_real_std,
     }
 
 
@@ -370,7 +691,7 @@ def _sat_integrate(z_grid, a_sp, g0, i_s):
     return out
 
 
-def _fit_saturated(zs, Is, a0, g0_init, i_max):
+def _fit_saturated(zs, Is, a0, g0_init, i_max, weights=None):
     """
     Full-curve fit of the gain-saturation model I(z) from
     dI/dz = A_sp + g0·I/(1+I/I_s), following the saturated-regime analysis in
@@ -381,16 +702,22 @@ def _fit_saturated(zs, Is, a0, g0_init, i_max):
     Nelder–Mead over (ln A_sp, ln g0, ln I_s), seeded from the SSG fit
     (a0, g0_init) and I_s ≈ half the maximum measured signal. Returns
     {A_sp, g0, I_s, r2, rss} or None.
+
+    weights: optional per-point 1/std² weights (see _fit_ssg for the same
+    convention) applied to the optimization objective only; "rss" and "r2"
+    in the returned dict are always computed unweighted so they stay
+    meaningful in the data's own natural units.
     """
     if len(zs) < 6 or i_max <= 0 or a0 <= 0 or g0_init <= 0:
         return None
+    w = weights if weights is not None else [1.0] * len(zs)
 
     def rss(p):
         a, g, s = (math.exp(v) for v in p)
         model = _sat_integrate(zs, a, g, s)
         if model is None:
             return float("inf")
-        r = sum((I - m) ** 2 for I, m in zip(Is, model))
+        r = sum(wi * (I - m) ** 2 for wi, I, m in zip(w, Is, model))
         return r if math.isfinite(r) else float("inf")
 
     # Initial simplex around the seed (log-space)
@@ -435,61 +762,231 @@ def _fit_saturated(zs, Is, a0, g0_init, i_max):
         return None
     a, g0, i_s = (math.exp(v) for v in simplex[best])
 
+    model_best = _sat_integrate(zs, a, g0, i_s)
+    if model_best is None:
+        return None
+    rss_plain = sum((I - m) ** 2 for I, m in zip(Is, model_best))
     mean_I = sum(Is) / len(Is)
     ss_tot = sum((I - mean_I) ** 2 for I in Is)
-    r2 = 1.0 - fv[best] / ss_tot if ss_tot > 0 else 0.0
-    return {"A_sp": a, "g0": g0, "I_s": i_s, "rss": fv[best], "r2": r2}
+    r2 = 1.0 - rss_plain / ss_tot if ss_tot > 0 else 0.0
+    return {"A_sp": a, "g0": g0, "I_s": i_s, "rss": rss_plain, "r2": r2}
 
 
-def _vsl_saturated(xs, ys, z0=None, seed=None):
+def _fit_saturated_ci(zs, Is, fit, weights=None):
+    """
+    Delta-method 95% CI for g0, mirroring the analytic Jacobian/variance
+    approach in _fit_ssg but via finite differences (the Gsat model has no
+    closed-form derivative since _sat_integrate is a numerical ODE solve).
+    """
+    n = len(zs)
+    df = n - 3
+    if df <= 0:
+        return None
+    w = weights if weights is not None else [1.0] * n
+    p0 = [math.log(fit["A_sp"]), math.log(fit["g0"]), math.log(fit["I_s"])]
+
+    def resid(p):
+        aa, gg, ss = (math.exp(v) for v in p)
+        model = _sat_integrate(zs, aa, gg, ss)
+        if model is None:
+            return None
+        return [I - m for I, m in zip(Is, model)]
+
+    r0 = resid(p0)
+    if r0 is None:
+        return None
+    h = 1e-4
+    J = [[0.0] * 3 for _ in range(n)]
+    for j in range(3):
+        p1 = list(p0)
+        p1[j] += h
+        r1 = resid(p1)
+        if r1 is None:
+            return None
+        for i in range(n):
+            J[i][j] = (r1[i] - r0[i]) / h
+
+    JTJ = [[sum(w[i] * J[i][a] * J[i][b] for i in range(n)) for b in range(3)]
+           for a in range(3)]
+    col = _solve3(JTJ, [0.0, 1.0, 0.0])   # inverse(JTJ) column for ln(g0)
+    if col is None:
+        return None
+    if weights is None:
+        rss_val = sum(r * r for r in r0)
+        sigma2 = rss_val / df
+        var_ln_g0 = sigma2 * col[1]
+    else:
+        var_ln_g0 = col[1]         # calibrated weights ⇒ no residual rescale
+    if var_ln_g0 <= 0:
+        return None
+    # delta method: d(g0)/d(ln g0) = g0
+    ci = fit["g0"] * _t95(df) * math.sqrt(var_ln_g0)
+    # A handful of cutoffs land on an ill-conditioned J^T J (near-degenerate
+    # ODE sensitivity at small n) and blow up to a nonsense CI that would
+    # otherwise dominate the plot's y-scale — treat those as non-converged.
+    if not math.isfinite(ci) or ci > 50.0 * max(abs(fit["g0"]), 1e-9):
+        return None
+    return ci
+
+
+def _vsl_saturated_scan(xs, ys, z0=None, stds=None):
+    """
+    Gsat cutoff scan (Fig 3b style): re-fits the saturation model over
+    growing [z0, z_fit] windows, the same way _vsl_gain scans the SSG model,
+    so both models can be plotted/compared the same way. Each fit is warm-
+    started from the previous cutoff's optimum.
+
+    stds: see _vsl_gain — real per-point std weights the fit by 1/std².
+    """
+    n = min(len(xs), len(ys))
+    if n < 9:
+        return None
+    stds_use = list(stds[:n]) if stds is not None else [0.0] * n
+    triples = sorted(zip(xs[:n], ys[:n], stds_use))
+    all_z = [t[0] for t in triples]
+    all_I = [t[1] for t in triples]
+    all_s = [t[2] for t in triples]
+    if z0 is None:
+        z0 = _vsl_auto_z0(all_z, all_I)
+
+    filt = [(z, I, s) for z, I, s in zip(all_z, all_I, all_s) if z >= z0 - 1e-12]
+    if len(filt) < 9:
+        return None
+    zs_abs = [p[0] for p in filt]
+    baseline = _vsl_baseline(zs_abs, [p[1] for p in filt])
+    Is = [p[1] - baseline for p in filt]
+    Ss = [p[2] for p in filt]
+    zs_rel = [z - z0 for z in zs_abs]
+
+    have_real_std = any(s and s > 0 for s in Ss)
+    weights_full = _fit_weights(Ss) if have_real_std else None
+
+    z_span = max(zs_rel[-1], 1e-9)
+    i_max = max(Is) if Is else 1.0
+    a_seed = max(i_max / z_span * 0.01, 1e-9)
+    g_seed = 1.0 / z_span
+
+    scan = []
+    prev = None
+    for end_idx in range(5, len(zs_rel)):
+        zseg = zs_rel[: end_idx + 1]
+        Iseg = Is[: end_idx + 1]
+        wseg = weights_full[: end_idx + 1] if weights_full is not None else None
+        i_seg_max = max(Iseg) if Iseg else i_max
+        a0 = prev["A_sp"] if prev else a_seed
+        g0i = prev["g0"] if prev else g_seed
+        fit = _fit_saturated(zseg, Iseg, a0, g0i, i_seg_max, weights=wseg)
+        if fit is None:
+            continue
+        # Small-n cutoffs (3 free params) can converge to an implausible g0
+        # that technically minimizes RSS but blows up the ODE — g·z_span
+        # beyond ~50 means it saturated almost immediately, which the model
+        # can't distinguish from "even larger", so reject rather than seed
+        # off it (this Gsat model isn't scale-invariant like the SSG one).
+        if not math.isfinite(fit["g0"]) or fit["g0"] <= 0 \
+                or fit["g0"] * (zseg[-1] - zseg[0] or 1e-9) > 50.0:
+            continue
+        prev = fit
+        ci = _fit_saturated_ci(zseg, Iseg, fit, weights=wseg)
+        scan.append({
+            "z_fit": round(zs_abs[end_idx], 6),
+            "g0": round(fit["g0"], 6),
+            "ci95": round(ci, 6) if ci is not None and math.isfinite(ci) else None,
+            "n_pts": end_idx + 1,
+        })
+
+    if not scan:
+        return None
+    finite = [s for s in scan if s["ci95"] is not None]
+    if not finite:
+        return None
+    best = min(finite, key=lambda s: s["ci95"])
+    return {"scan": scan, "best_g0": best["g0"], "best_ci95": best["ci95"],
+            "best_z_fit": best["z_fit"], "z0": z0}
+
+
+def _vsl_saturated(xs, ys, z0=None, seed=None, stds=None):
     """
     Fit the saturation model to the full dataset and return fit parameters,
     a smooth model curve I(z), the model's local gain g(z)=g0/(1+I/I_s), and
     z_sat defined as the stripe length where I(z) reaches I_s.
+
+    stds: see _vsl_gain — real per-point std weights the fit by 1/std².
     """
     n = min(len(xs), len(ys))
     if n < 6:
         return None
-    pairs = sorted(zip(xs[:n], ys[:n]))
-    if z0 is not None:
-        pairs = [p for p in pairs if p[0] >= z0 - 1e-12]
-    if len(pairs) < 6:
+    stds_use = list(stds[:n]) if stds is not None else [0.0] * n
+    triples = sorted(zip(xs[:n], ys[:n], stds_use))
+    if z0 is None:
+        z0 = (seed or {}).get("z0")
+        if z0 is None:
+            z0 = _vsl_auto_z0([t[0] for t in triples], [t[1] for t in triples])
+    triples = [t for t in triples if t[0] >= z0 - 1e-12]
+    if len(triples) < 6:
         return None
-    zs = [p[0] for p in pairs]
-    Is = [p[1] for p in pairs]
+    zs = [t[0] for t in triples]
+    Is = [t[1] for t in triples]
+    Ss = [t[2] for t in triples]
+
+    # The saturation ODE is integrated from I(0)=0 (see _sat_integrate), so
+    # it needs the same background subtraction as the SSG fit.
+    baseline = (seed or {}).get("baseline")
+    if baseline is None:
+        baseline = _vsl_baseline(zs, Is)
+    Is = [I - baseline for I in Is]
     i_max = max(Is)
 
-    a0 = (seed or {}).get("A_sp") or i_max / max(zs[-1], 1e-9) * 0.01
-    g0i = (seed or {}).get("best_g") or 1.0 / max(zs[-1], 1e-9)
-    fit = _fit_saturated(zs, Is, a0, g0i, i_max)
+    have_real_std = any(s and s > 0 for s in Ss)
+    weights = _fit_weights(Ss) if have_real_std else None
+
+    # _sat_integrate always integrates the ODE from I(0)=0 at the start of
+    # its z_grid, so it must be given z relative to z0 — otherwise, with z0
+    # truncating away a lot of the raw scan (e.g. dead travel before the
+    # stripe reaches the sample), it would silently integrate the model
+    # through that whole unobserved absolute-z range first, deep into
+    # saturation, before ever reaching the measured window.
+    z_span = zs[-1] - z0
+    zs_rel = [z - z0 for z in zs]
+
+    a0 = (seed or {}).get("A_sp") or i_max / max(z_span, 1e-9) * 0.01
+    g0i = (seed or {}).get("best_g") or 1.0 / max(z_span, 1e-9)
+    fit = _fit_saturated(zs_rel, Is, a0, g0i, i_max, weights=weights)
     if fit is None:
         return None
 
     # Smooth model curve + local gain over the measured range
-    z_hi = zs[-1]
-    curve_z = [z_hi * i / 200 for i in range(201)]
-    curve_I = _sat_integrate(curve_z, fit["A_sp"], fit["g0"], fit["I_s"])
+    curve_z_rel = [z_span * i / 200 for i in range(201)]
+    curve_I = _sat_integrate(curve_z_rel, fit["A_sp"], fit["g0"], fit["I_s"])
     if curve_I is None:
         return None
     curve_g = [fit["g0"] / (1.0 + I / fit["I_s"]) for I in curve_I]
 
-    # z_sat: where the model intensity crosses I_s (gain compressed to g0/2)
+    # z_sat: where the model intensity crosses I_s (gain compressed to g0/2),
+    # computed on the ASE-only (pre-baseline) curve to match fit["I_s"]
     z_sat = None
-    for i in range(1, len(curve_z)):
+    for i in range(1, len(curve_z_rel)):
         if curve_I[i] >= fit["I_s"]:
             f0, f1 = curve_I[i - 1], curve_I[i]
             t = (fit["I_s"] - f0) / (f1 - f0) if f1 > f0 else 0.0
-            z_sat = curve_z[i - 1] + t * (curve_z[i] - curve_z[i - 1])
+            z_sat = z0 + curve_z_rel[i - 1] + t * (curve_z_rel[i] - curve_z_rel[i - 1])
             break
+
+    # Add the baseline back and shift back to absolute z for display
+    curve_I = [I + baseline for I in curve_I]
+    curve_z = [round(z0 + z, 6) for z in curve_z_rel]
 
     return {"g0": round(fit["g0"], 6),
             "I_s": fit["I_s"],
             "A_sp": fit["A_sp"],
+            "baseline": round(baseline, 6),
+            "z0": z0,
             "z_sat": round(z_sat, 6) if z_sat is not None else None,
             "r2": round(fit["r2"], 5),
-            "curve_z": [round(z, 6) for z in curve_z],
+            "curve_z": curve_z,
             "curve_I": curve_I,
-            "curve_g": [round(g, 6) for g in curve_g]}
+            "curve_g": [round(g, 6) for g in curve_g],
+            "weighted": have_real_std}
 
 
 def _vsl_instantaneous(xs, ys, z0=None, a_sp=None):
@@ -520,12 +1017,20 @@ def _vsl_instantaneous(xs, ys, z0=None, a_sp=None):
     if n < 5:
         return None
     pairs = sorted(zip(xs[:n], ys[:n]))
-    if z0 is not None:
-        pairs = [p for p in pairs if p[0] >= z0 - 1e-12]
+    if z0 is None:
+        z0 = _vsl_auto_z0([p[0] for p in pairs], [p[1] for p in pairs])
+    pairs = [p for p in pairs if p[0] >= z0 - 1e-12]
     if len(pairs) < 5:
         return None
     zs = [p[0] for p in pairs]
     Is = [p[1] for p in pairs]
+
+    # Strip the non-ASE background offset first — g_inst = d(lnI)/dz − A_sp/I
+    # divides by I(z), so a left-in baseline inflates I(z) and biases g_inst
+    # low across the whole curve, on top of breaking the I(z→0)≈0 assumption
+    # the A_sp z→0-intercept extrapolation below relies on.
+    baseline = _vsl_baseline(zs, Is)
+    Is = [I - baseline for I in Is]
 
     # Light 3-point smoothing of I before differencing (derivatives amplify noise)
     Ism = [Is[0]] + [(Is[i - 1] + Is[i] + Is[i + 1]) / 3.0
@@ -617,6 +1122,9 @@ def _run_scan(cfg, act, axis_key, x_unit, det, metric, wavelength):
     """
     settle_s = cfg["settle_s"]; dwell_s = cfg["dwell_s"]
     inter_s = cfg["inter_s"]; repeat = cfg["repeat"]
+    samples_per_point = cfg.get("samples_per_point", 1)
+    outlier_sigma = cfg.get("outlier_sigma", 3.0)
+    reject_outliers = cfg.get("reject_outliers", True)
 
     act.begin_scan(); det.begin_scan()
     origin = None
@@ -640,7 +1148,10 @@ def _run_scan(cfg, act, axis_key, x_unit, det, metric, wavelength):
                     origin = pos
                 z = abs(pos - origin)
 
-                m = det.measure(metric, wavelength, dwell_s)
+                m = _measure_averaged(det, metric, wavelength, dwell_s,
+                                      samples_per_point,
+                                      outlier_sigma=outlier_sigma,
+                                      reject_outliers=reject_outliers)
                 if m is None:
                     _scan["error"] = f"No reading from {det.name}"
                     break
@@ -654,6 +1165,7 @@ def _run_scan(cfg, act, axis_key, x_unit, det, metric, wavelength):
                         "vmin": m.get("vmin", m["value"]),
                         "vmax": m.get("vmax", m["value"]),
                         "unit": m.get("unit", ""), "n": m.get("n", 1),
+                        "n_rejected": m.get("n_rejected", 0),
                         "t": time.time(),
                     })
                     _spectra.append(m.get("spectrum"))
@@ -742,6 +1254,7 @@ def _register_scan_routes(app: Flask) -> None:
             ],
             "active_detector": _active_detector_block(det),
             "metric": metric, "wavelength": _sel_wavelength,
+            "band_width": _sel_band_width,
             "power": {"connected": power.is_connected(),
                       "wavelength": _power_wavelength()},
         })
@@ -756,7 +1269,7 @@ def _register_scan_routes(app: Flask) -> None:
 
     @app.route("/api/scan/detector", methods=["POST"])
     def scan_set_detector():
-        global _sel_metric, _sel_wavelength
+        global _sel_metric, _sel_wavelength, _sel_band_width
         if _scan["running"]:
             return jsonify({"error": "Stop the scan first"}), 409
         ok, msg = detectors.manager.set_active(request.get_json(force=True).get("id", ""))
@@ -767,17 +1280,21 @@ def _register_scan_routes(app: Flask) -> None:
         _sel_metric = mets[0]["key"] if mets else "power"
         rng = det.wavelength_range()
         _sel_wavelength = round((rng[0] + rng[1]) / 2, 1) if rng else None
+        _sel_band_width = 0.0
         return jsonify({"ok": True, "active": det.id})
 
     @app.route("/api/scan/detector/metric", methods=["POST"])
     def scan_set_metric():
-        global _sel_metric, _sel_wavelength
+        global _sel_metric, _sel_wavelength, _sel_band_width
         data = request.get_json(force=True)
         if "metric" in data:
             _sel_metric = str(data["metric"])
         if "wavelength" in data and data["wavelength"] is not None:
             _sel_wavelength = float(data["wavelength"])
-        return jsonify({"ok": True, "metric": _sel_metric, "wavelength": _sel_wavelength})
+        if "band_width" in data and data["band_width"] is not None:
+            _sel_band_width = max(0.0, float(data["band_width"]))
+        return jsonify({"ok": True, "metric": _sel_metric, "wavelength": _sel_wavelength,
+                        "band_width": _sel_band_width})
 
     @app.route("/api/scan/detector/acquire", methods=["POST"])
     def scan_set_acquire():
@@ -831,6 +1348,9 @@ def _register_scan_routes(app: Flask) -> None:
             inter_s = max(0.0, float(data.get("inter_s", 0.0)))
             bidirectional = bool(data.get("bidirectional", False))
             repeat = bool(data.get("repeat", False))
+            samples_per_point = max(1, int(data.get("samples_per_point", 5)))
+            outlier_sigma = max(0.5, float(data.get("outlier_sigma", 3.0)))
+            reject_outliers = bool(data.get("reject_outliers", True))
 
             lo, hi, unit = axis["min"], axis["max"], axis["unit"]
             for nm, v in (("start", start), ("stop", stop)):
@@ -843,13 +1363,16 @@ def _register_scan_routes(app: Flask) -> None:
             if not ready:
                 return jsonify({"error": why}), 409
 
-            metric, wavelength = _ensure_metric(det), _sel_wavelength
+            metric, wavelength = _ensure_metric(det), _wl_arg()
             ymeta = det.y_meta(metric)
             cfg = {"axis": axis_key, "start": start, "stop": stop,
                    "steps": steps, "step_size": step_size,
                    "settle_s": settle_s, "dwell_s": dwell_s, "inter_s": inter_s,
+                   "samples_per_point": samples_per_point,
+                   "outlier_sigma": outlier_sigma, "reject_outliers": reject_outliers,
                    "bidirectional": bidirectional, "repeat": repeat,
-                   "detector": det.id, "metric": metric, "wavelength": wavelength}
+                   "detector": det.id, "metric": metric, "wavelength": _sel_wavelength,
+                   "band_width": _sel_band_width}
             total = len(_setpoints(start, stop, steps, step_size, bidirectional))
 
             with _points_lock:
@@ -857,7 +1380,8 @@ def _register_scan_routes(app: Flask) -> None:
             _scan.update({
                 "running": True, "actuator": act.id, "axis": axis_key,
                 "x_label": axis["label"], "x_unit": unit,
-                "detector": det.id, "metric": metric, "wavelength": wavelength,
+                "detector": det.id, "metric": metric, "wavelength": _sel_wavelength,
+                "band_width": _sel_band_width,
                 "y_label": ymeta["label"], "y_unit": ymeta["unit"], "y_kind": ymeta["kind"],
                 "total": total, "done": 0, "current_setpoint": None,
                 "message": "Starting…", "error": "",
@@ -878,6 +1402,20 @@ def _register_scan_routes(app: Flask) -> None:
         _abort.set()
         return jsonify({"ok": True})
 
+    @app.route("/api/scan/clear", methods=["POST"])
+    def scan_clear():
+        global _points, _spectra
+        with _scan_lock:
+            if _scan["running"]:
+                return jsonify({"error": "Stop the scan before clearing its results"}), 409
+            with _points_lock:
+                _points = []
+                _spectra = []
+            _scan.update({"done": 0, "total": 0, "current_setpoint": None,
+                          "message": "Results cleared.", "error": "",
+                          "spectra_wavelengths": None})
+        return jsonify({"ok": True})
+
     @app.route("/api/scan/status")
     def scan_status():
         with _points_lock:
@@ -895,7 +1433,7 @@ def _register_scan_routes(app: Flask) -> None:
             out["detector_status"] = {
                 "id": det.id, "name": det.name, "kind": det.kind,
                 "connected": det.connected(),
-                "value": det.live(metric, _sel_wavelength),
+                "value": det.live(metric, _wl_arg()),
                 "unit": ym["unit"], "y_kind": ym["kind"], "label": ym["label"],
             }
         else:
@@ -974,12 +1512,12 @@ def _register_scan_routes(app: Flask) -> None:
                 continue
             if hi < lo:
                 lo, hi = hi, lo
-            vals = [(_trapz_area(s, wl, lo, hi) if s else None) for s in specs]
+            vals = [(_sum_counts(s, wl, lo, hi) if s else None) for s in specs]
             out.append({"lo": round(lo, 3), "hi": round(hi, 3),
                         "label": f"{lo:g}–{hi:g} nm", "values": vals})
         return jsonify({"x": x, "x_label": _scan.get("x_label"),
                         "x_unit": _scan.get("x_unit"),
-                        "unit": "counts·nm", "bands": out})
+                        "unit": "counts", "bands": out})
 
     @app.route("/api/scan/bands/download", methods=["POST"])
     def scan_bands_download():
@@ -998,14 +1536,14 @@ def _register_scan_routes(app: Flask) -> None:
                 continue
             cleaned.append((min(lo, hi), max(lo, hi)))
         buf = io.StringIO(); w = csv.writer(buf)
-        w.writerow([f"# VSL band-integrated areas (counts·nm)  "
+        w.writerow([f"# VSL band summed counts (counts)  "
                     f"detector={_scan.get('detector')}  axis={_scan.get('axis')}"])
         w.writerow(["index", "setpoint", _scan.get("x_label", "x")]
                    + [f"area_{lo:g}-{hi:g}nm" for lo, hi in cleaned])
         for p, s in zip(pts, specs):
             row = [p["i"], f"{p['setpoint']:.5f}", f"{p['x']:.5f}"]
             for lo, hi in cleaned:
-                row.append(f"{_trapz_area(s, wl, lo, hi):.6e}" if s else "")
+                row.append(f"{_sum_counts(s, wl, lo, hi):.6e}" if s else "")
             w.writerow(row)
         fname = time.strftime("bands_%Y%m%d_%H%M%S.csv")
         return Response(buf.getvalue(), mimetype="text/csv",
@@ -1081,24 +1619,48 @@ def _register_scan_routes(app: Flask) -> None:
         return Response(buf.getvalue(), mimetype="text/csv",
                         headers={"Content-Disposition": f"attachment; filename={fname}"})
 
-    @app.route("/api/scan/vsl")
+    @app.route("/api/scan/vsl", methods=["GET", "POST"])
     def scan_vsl():
         with _points_lock:
             pts = list(_points)
+            specs = list(_spectra)
         if len(pts) < 5:
             return jsonify({"error": "Need ≥5 scan points for VSL gain analysis"}), 400
         xs = [p["x"] for p in pts]
         ys = [p["value"] for p in pts]
-        z0_raw = request.args.get("z0")
-        z0 = float(z0_raw) if z0_raw else None
-        res = _vsl_gain(xs, ys, z0=z0)
+        stds = [p["std"] for p in pts]
+        data = request.get_json(silent=True) or {}
+        z0_raw = data.get("z0", request.args.get("z0"))
+        z0 = float(z0_raw) if z0_raw is not None and z0_raw != "" else None
+        use_spectral = bool(data.get("spectral_auto", True))
+        wl = _scan.get("spectra_wavelengths")
+        if use_spectral and wl and any(specs):
+            raw_band = data.get("band")
+            manual_band = None
+            if raw_band is not None:
+                try:
+                    manual_band = (float(raw_band[0]), float(raw_band[1]))
+                except (TypeError, ValueError, IndexError):
+                    return jsonify({"error": "Manual VSL band requires two wavelengths"}), 400
+            spectral = _spectral_vsl_analysis(xs, specs, wl, manual_band=manual_band)
+            if spectral is not None:
+                spectral.update({"x_label": _scan.get("x_label"),
+                                 "x_unit": _scan.get("x_unit"),
+                                 "y_label": "Background-subtracted band counts",
+                                 "y_unit": "counts"})
+                return jsonify(spectral)
+            if manual_band is not None:
+                return jsonify({"error": "Manual VSL band contains no usable spectrum pixels or fit range"}), 400
+        res = _vsl_gain(xs, ys, z0=z0, stds=stds)
         if res is None:
             return jsonify({"error": "VSL fit failed — verify data shows a rising "
                                      "ASE-like curve before running gain analysis"}), 400
         # Instantaneous gain uses the fitted A_sp for consistency (De Giorgi & Anni)
         res["inst"] = _vsl_instantaneous(xs, ys, z0=z0, a_sp=res.get("A_sp"))
         # Full-curve gain-saturation model dI/dz = A_sp + g0·I/(1+I/I_s)
-        res["sat"] = _vsl_saturated(xs, ys, z0=z0, seed=res)
+        res["sat"] = _vsl_saturated(xs, ys, z0=z0, seed=res, stds=stds)
+        # Gsat cutoff scan (Fig 3b style) for the gain-vs-z_fit comparison plot
+        res["sat_scan"] = _vsl_saturated_scan(xs, ys, z0=z0, stds=stds)
         res.update({
             "x_label": _scan.get("x_label"), "x_unit": _scan.get("x_unit"),
             "y_label": _scan.get("y_label"), "y_unit": _scan.get("y_unit"),
@@ -1131,9 +1693,13 @@ def _register_scan_routes(app: Flask) -> None:
             return jsonify({"error": "Need ≥5 scan points"}), 400
         xs = [p["x"] for p in pts]
         ys = [p["value"] for p in pts]
-        z0_raw = request.args.get("z0")
-        z0 = float(z0_raw) if z0_raw else None
-        res = _vsl_gain(xs, ys, z0=z0)
+        stds = [p["std"] for p in pts]
+        # z0 arrives as a query arg on direct GETs and as JSON when this view
+        # is invoked from within scan_export's POST request.
+        data = request.get_json(silent=True) or {}
+        z0_raw = data.get("z0", request.args.get("z0"))
+        z0 = float(z0_raw) if z0_raw is not None and z0_raw != "" else None
+        res = _vsl_gain(xs, ys, z0=z0, stds=stds)
         if res is None:
             return jsonify({"error": "VSL fit failed"}), 400
         xu = _scan.get("x_unit", "")
@@ -1143,8 +1709,9 @@ def _register_scan_routes(app: Flask) -> None:
         w.writerow([f"# best_g={res['best_g']:.6f} 1/{xu}"
                     f"  CI95=±{res['best_ci95']:.6f}"
                     f"  z_sat={res['z_sat']:.4f} {xu}"
-                    f"  A_sp={res['A_sp']:.6e}"])
-        sat = _vsl_saturated(xs, ys, z0=z0, seed=res)
+                    f"  A_sp={res['A_sp']:.6e}"
+                    f"  error_weighted={res.get('weighted', False)}"])
+        sat = _vsl_saturated(xs, ys, z0=z0, seed=res, stds=stds)
         if sat:
             zsat = f"{sat['z_sat']:.4f} {xu}" if sat["z_sat"] is not None \
                    else "not reached"
@@ -1215,12 +1782,13 @@ def _register_scan_routes(app: Flask) -> None:
 
         xs = [p["x"] for p in pts]
         ys = [p["value"] for p in pts]
+        stds = [p["std"] for p in pts]
 
         band_curves = []
         wl = _scan.get("spectra_wavelengths")
         if wl and any(specs):
             for lo, hi in _parse_bands_arg():
-                vals = [(_trapz_area(s, wl, lo, hi) if s else None) for s in specs]
+                vals = [(_sum_counts(s, wl, lo, hi) if s else None) for s in specs]
                 band_curves.append({"x": xs, "values": vals,
                                     "label": f"{lo:g}–{hi:g} nm"})
 
@@ -1231,9 +1799,9 @@ def _register_scan_routes(app: Flask) -> None:
         if request.args.get("vsl"):
             z0_raw = request.args.get("z0")
             z0v = float(z0_raw) if z0_raw else None
-            vsl = _vsl_gain(xs, ys, z0=z0v)
+            vsl = _vsl_gain(xs, ys, z0=z0v, stds=stds)
             if vsl:
-                vsl["sat"] = _vsl_saturated(xs, ys, z0=z0v, seed=vsl)
+                vsl["sat"] = _vsl_saturated(xs, ys, z0=z0v, seed=vsl, stds=stds)
 
         fig = plots.scan_figure(pts, _scan_meta(),
                                 bands=band_curves, profile=profile, vsl=vsl)
@@ -1251,13 +1819,16 @@ def _register_scan_routes(app: Flask) -> None:
         z0_raw = request.args.get("z0")
         xs = [p["x"] for p in pts]
         ys = [p["value"] for p in pts]
+        stds = [p["std"] for p in pts]
         z0 = float(z0_raw) if z0_raw else None
-        res = _vsl_gain(xs, ys, z0=z0)
+        res = _vsl_gain(xs, ys, z0=z0, stds=stds)
         if res is None:
             return jsonify({"error": "VSL fit failed"}), 400
         res["inst"] = _vsl_instantaneous(xs, ys, z0=z0, a_sp=res.get("A_sp"))
-        res["sat"] = _vsl_saturated(xs, ys, z0=z0, seed=res)
-        fig = plots.vsl_figure(res, _scan_meta())
+        res["sat"] = _vsl_saturated(xs, ys, z0=z0, seed=res, stds=stds)
+        res["sat_scan"] = _vsl_saturated_scan(xs, ys, z0=z0, stds=stds)
+        log_scale = request.args.get("log", "0") not in ("0", "false", "no")
+        fig = plots.vsl_figure(res, _scan_meta(), log_scale=log_scale)
         return plots.respond(fig, "vsl_gain")
 
     @app.route("/api/scan/spectra/plot")
@@ -1274,6 +1845,69 @@ def _register_scan_routes(app: Flask) -> None:
         fig = plots.spectra_map_figure(wl, specs, [p["x"] for p in pts],
                                        _scan_meta())
         return plots.respond(fig, "spectra_map")
+
+    @app.route("/api/scan/export", methods=["POST"])
+    def scan_export():
+        """Bundle every available scan result into one timestamped ZIP."""
+        with _points_lock:
+            pts = list(_points)
+            specs = list(_spectra)
+        if not pts:
+            return jsonify({"error": "No scan data yet"}), 404
+
+        data = request.get_json(silent=True) or {}
+        # Which overlays to draw on scan_plot.png — data files are exported in
+        # full either way, this only trims what gets crammed onto that figure.
+        plot_opts = data.get("plot") or {}
+        want_profile = bool(plot_opts.get("profile", True))
+        want_vsl = bool(plot_opts.get("vsl", True))
+        want_sat = bool(plot_opts.get("sat", True))
+
+        files = {"scan_data.csv": scan_download().get_data(as_text=True)}
+        wl = _scan.get("spectra_wavelengths")
+        if wl and any(specs):
+            files["spectra.csv"] = scan_spectra().get_data(as_text=True)
+
+        if data.get("bands") and wl and any(specs):
+            files["band_sums.csv"] = scan_bands_download().get_data(as_text=True)
+
+        profile = _gaussian_profile([p["x"] for p in pts], [p["value"] for p in pts])
+        if profile is not None:
+            files["beam_profile.csv"] = scan_profile_download().get_data(as_text=True)
+
+        vsl = None
+        if len(pts) >= 5:
+            xs = [p["x"] for p in pts]
+            ys = [p["value"] for p in pts]
+            stds = [p["std"] for p in pts]
+            z0_raw = data.get("z0")
+            z0 = float(z0_raw) if z0_raw is not None else None
+            vsl = _vsl_gain(xs, ys, z0=z0, stds=stds)
+            if vsl is not None:
+                vsl["inst"] = _vsl_instantaneous(xs, ys, z0=z0,
+                                                 a_sp=vsl.get("A_sp"))
+                vsl["sat"] = _vsl_saturated(xs, ys, z0=z0, seed=vsl, stds=stds)
+                vsl["sat_scan"] = _vsl_saturated_scan(xs, ys, z0=z0, stds=stds)
+                files["vsl_gain.csv"] = scan_vsl_download().get_data(as_text=True)
+
+        if plots.MPL_OK:
+            plot_profile = profile if want_profile else None
+            plot_vsl = None
+            if vsl is not None and want_vsl:
+                plot_vsl = dict(vsl)
+                if not want_sat:
+                    plot_vsl["sat"] = None
+            files["scan_plot.png"] = plots.figure_bytes(
+                plots.scan_figure(pts, _scan_meta(), profile=plot_profile,
+                                  vsl=plot_vsl))
+            if wl and any(specs):
+                files["spectra_map.png"] = plots.figure_bytes(
+                    plots.spectra_map_figure(wl, specs, [p["x"] for p in pts],
+                                             _scan_meta()))
+            if vsl is not None:
+                files["vsl_gain_plot.png"] = plots.figure_bytes(
+                    plots.vsl_figure(vsl, _scan_meta()))
+        return plots.zip_response(files, "scan_export")
 
 
 # ---------------------------------------------------------------------------

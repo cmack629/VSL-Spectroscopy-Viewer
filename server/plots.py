@@ -9,7 +9,10 @@ Every endpoint accepts ?format=png|svg|pdf (default png).
 """
 
 import io
+import math
+import os
 import time
+import zipfile
 
 from flask import Response, jsonify, request
 
@@ -63,6 +66,30 @@ def respond(fig, stem: str) -> Response:
     return Response(buf.getvalue(), mimetype=FORMATS[fmt],
                     headers={"Content-Disposition":
                              f"attachment; filename={fname}"})
+
+
+def figure_bytes(fig, fmt: str = "png") -> bytes:
+    """Render a Figure for inclusion in an archive."""
+    buf = io.BytesIO()
+    fig.savefig(buf, format=fmt, dpi=200, bbox_inches="tight", facecolor="white")
+    return buf.getvalue()
+
+
+def zip_response(files: dict[str, str | bytes], stem: str) -> Response:
+    """Return a ZIP with date-foldered, consistently timestamped file names."""
+    now = time.localtime()
+    date = time.strftime("%Y%m%d", now)
+    timestamp = time.strftime("%Y%m%d_%H%M%S", now)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for name, content in files.items():
+            base, ext = os.path.splitext(name)
+            archived_name = f"{date}/{base}_{timestamp}{ext}"
+            archive.writestr(archived_name, content)
+    filename = f"{stem}_{timestamp}.zip"
+    return Response(buf.getvalue(), mimetype="application/zip",
+                    headers={"Content-Disposition":
+                             f"attachment; filename={filename}"})
 
 
 def _axis_label(label: str, unit: str) -> str:
@@ -144,9 +171,19 @@ def scan_figure(pts, meta, bands=None, profile=None, vsl=None):
     return fig
 
 
-def vsl_figure(res, meta):
-    """Cutoff-scan of the fitted small-signal gain: g vs z_fit with 95 % CI."""
-    fig, ax = new_figure(8.0, 4.2)
+SSG_BLUE = "#3a6ea8"
+GSAT_RED = "#c0392b"
+
+
+def vsl_figure(res, meta, log_scale=False):
+    """
+    Gain vs stripe-length cutoff (z_fit), SSG and Gsat models overlaid with
+    their own 95 % CI bands and best-fit-point callouts — reproduces the
+    style of Fig. 3b in Alvarado-Leaños et al., Adv. Optical Mater. 2021,
+    2001773 ("Optical Gain of Lead Halide Perovskites Measured via the
+    Variable Stripe Length Method").
+    """
+    fig, ax = new_figure(7.0, 5.0)
     xu = meta.get("x_unit", "")
     scan = res["scan"]
     zs = [s["z_fit"] for s in scan]
@@ -154,31 +191,70 @@ def vsl_figure(res, meta):
     lo = [s["g"] - (s["ci95"] or 0) for s in scan]
     hi = [s["g"] + (s["ci95"] or 0) for s in scan]
 
-    ax.fill_between(zs, lo, hi, color=ACCENT, alpha=0.15, label="95 % CI")
-    ax.plot(zs, gs, "-", lw=1.5, color=ACCENT, label="g(z$_{fit}$) cutoff scan")
-    inst = res.get("inst")
-    if inst:
-        ax.plot(inst["z"], inst["g_inst"], "o-", ms=3, lw=1.0, color=ORANGE,
-                alpha=0.8,
-                label=f"g$_{{inst}}$(z)=(dI/dz−A$_{{sp}}$)/I  "
-                      f"plateau {inst['g0']:.4g} 1/{xu}")
-    sat = res.get("sat")
-    if sat:
-        ax.plot(sat["curve_z"], sat["curve_g"], "-", lw=1.6, color="#7a52c7",
-                label=f"saturation model g$_0$/(1+I/I$_s$)  "
-                      f"g$_0$={sat['g0']:.4g} 1/{xu}")
-        if sat.get("z_sat") is not None:
-            ax.axvline(sat["z_sat"], color="#7a52c7", lw=0.9, ls="-.",
-                       label=f"z(I=I$_s$)={sat['z_sat']:.3g} {xu}")
-    ax.axhline(res["best_g"], color="#b39a1f", lw=1.0, ls="--",
-               label=f"g={res['best_g']:.4g} ±{res['best_ci95']:.2g} 1/{xu}")
-    ax.axvline(res["z_sat"], color=GREEN, lw=1.0, ls=":",
-               label=f"z$_{{sat}}$={res['z_sat']:.3g} {xu}")
+    ax.fill_between(zs, lo, hi, color=SSG_BLUE, alpha=0.15)
+    ax.plot(zs, gs, "o", ms=4, mfc=SSG_BLUE, mec=SSG_BLUE,
+            label="Small-signal gain (SSG)")
+
+    best_ssg = min((s for s in scan if s["ci95"] is not None),
+                   key=lambda s: s["ci95"], default=None)
+    if best_ssg:
+        ax.annotate(f"({best_ssg['z_fit']:.3g}, {best_ssg['g']:.3g})",
+                    xy=(best_ssg["z_fit"], best_ssg["g"]),
+                    xytext=(15, 18), textcoords="offset points", fontsize=8,
+                    color=SSG_BLUE,
+                    arrowprops=dict(arrowstyle="->", color=SSG_BLUE, lw=1.0))
+
+    all_zs = list(zs)
+    sat_scan = res.get("sat_scan")
+    if sat_scan:
+        gz = [s["z_fit"] for s in sat_scan["scan"]]
+        gg = [s["g0"] for s in sat_scan["scan"]]
+        glo = [s["g0"] - (s["ci95"] or 0) for s in sat_scan["scan"]]
+        ghi = [s["g0"] + (s["ci95"] or 0) for s in sat_scan["scan"]]
+        ax.fill_between(gz, glo, ghi, color=GSAT_RED, alpha=0.15)
+        ax.plot(gz, gg, "o", ms=4, mfc=GSAT_RED, mec=GSAT_RED,
+                label="Gain saturation (Gsat)")
+        all_zs += gz
+
+        best_gsat = next((s for s in sat_scan["scan"]
+                          if s["z_fit"] == sat_scan["best_z_fit"]), None)
+        if best_gsat:
+            ax.annotate(f"({best_gsat['z_fit']:.3g}, {best_gsat['g0']:.3g})",
+                        xy=(best_gsat["z_fit"], best_gsat["g0"]),
+                        xytext=(15, -22), textcoords="offset points",
+                        fontsize=8, color=GSAT_RED,
+                        arrowprops=dict(arrowstyle="->", color=GSAT_RED, lw=1.0))
+
+    # Truncate to the actual fit domain — z0 excludes pre-onset baseline/dead
+    # travel, so there's nothing meaningful (or, pre-fix, anything at all) to
+    # show to its left.
+    z0 = res.get("z0")
+    title = "VSL gain — SSG & Gsat cutoff scan"
+    if z0 is not None and all_zs:
+        ax.set_xlim(z0, max(all_zs))
+        title += f"  (z$_0$={z0:.3g} {xu})"
+
+    # A handful of thin-sample cutoffs (few points, 3 free Gsat params) get
+    # a legitimately wide CI — keep drawing the shading (matches the paper,
+    # whose bands also widen at small z_lim) but don't let it set the view;
+    # scale to the point estimates themselves, like the reference figure.
+    all_g_pts = gs + ([s["g0"] for s in sat_scan["scan"]] if sat_scan else [])
+    if all_g_pts and not log_scale:
+        g_lo, g_hi = min(all_g_pts), max(all_g_pts)
+        pad = 0.25 * (g_hi - g_lo) or max(abs(g_hi), 1.0)
+        ax.set_ylim(g_lo - pad, g_hi + pad)
 
     ax.set_xlabel(f"stripe length z ({xu})", fontsize=10)
-    ax.set_ylabel(f"gain g (1/{xu})", fontsize=10)
-    ax.set_title("VSL gain — cutoff scan & instantaneous gain", fontsize=11)
-    ax.legend(fontsize=8, frameon=False)
+    ylabel = f"gain g (1/{xu})"
+    if log_scale:
+        all_g = gs + ([s["g0"] for s in sat_scan["scan"]] if sat_scan else [])
+        abs_g = sorted(abs(g) for g in all_g if g and math.isfinite(g))
+        linthresh = max(abs_g[len(abs_g) // 20], 1e-6) if abs_g else 1e-4
+        ax.set_yscale("symlog", linthresh=linthresh)
+        ylabel += "  (symlog)"
+    ax.set_ylabel(ylabel, fontsize=10)
+    ax.set_title(title, fontsize=11)
+    ax.legend(fontsize=9, frameon=False, loc="upper right")
     return fig
 
 

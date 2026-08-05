@@ -427,6 +427,26 @@ def api_log_download():
     )
 
 
+@power_bp.route("/export")
+def api_export():
+    """Download the power log and available strip-chart plot in one ZIP."""
+    from server import plots
+    with _samples_lock:
+        pts = list(_samples)
+    files = {"power_log.csv": api_log_download().get_data(as_text=True)}
+    if plots.MPL_OK and len(pts) >= 2:
+        wavelength = None
+        try:
+            if _pm is not None:
+                wavelength = _pm.wavelength
+        except Exception:
+            pass
+        fig = plots.power_figure([t * 1000 for t, _ in pts], [p for _, p in pts],
+                                 _CHART_SECONDS, wavelength_nm=wavelength)
+        files["power_plot.png"] = plots.figure_bytes(fig)
+    return plots.zip_response(files, "pm400_export")
+
+
 @power_bp.route("/reconnect", methods=["POST"])
 def api_reconnect():
     global _pm

@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>VSL Scan</title>
+<title>VSL Scanner</title>
 <link rel="icon" type="image/png" href="/static/uah-logo.png">
 <link rel="stylesheet" href="/static/style.css">
 <script src="/static/theme.js"></script>
@@ -56,7 +56,8 @@ details.card .h{flex:1;margin:0}
 <body>
 
 <header class="app-header">
-  <img src="/static/uah-logo.png" alt="The University of Alabama in Huntsville" class="brand-logo">
+  <img src="/static/United_States_Army_Space_and_Missile_Defense_Command_Logo.svg"
+       alt="United States Army Space and Missile Defense Command" class="brand-logo">
   <div class="header-right">
     <span class="pill"><span class="led" id="led-act"></span><span id="txt-act">Actuator</span></span>
     <span class="pill"><span class="led" id="led-det"></span><span id="txt-det">Detector</span></span>
@@ -98,8 +99,14 @@ details.card .h{flex:1;margin:0}
       <div class="f span2"><label>Points</label><input type="number" id="in-nsteps" step="1" min="2" value="2"></div>
 
       <div class="f span3"><label><span class="hint" title="Wait after each move before measuring">Settle (s)</span></label><input type="number" id="in-settle" step="0.1" min="0" value="1.0"></div>
-      <div class="f span3"><label><span class="hint" title="Measurement window after settle; for spectrometers use at least the integration time">Dwell (s)</span></label><input type="number" id="in-dwell" step="0.1" min="0" value="0.5"></div>
-      <div class="f span6" style="align-self:end">
+      <div class="f span3"><label><span class="hint" title="Measurement window after settle. For spectrometers, auto-set from Integration × Averages so the window covers a full averaged acquisition">Dwell (s)</span></label>
+        <div class="inrow"><input type="number" id="in-dwell" step="0.1" min="0" value="0.5">
+          <label class="chk hidden" id="dwell-auto-field" style="white-space:nowrap"><input type="checkbox" id="in-dwell-auto" checked>Auto</label></div></div>
+      <div class="f span2"><label><span class="hint" title="Independent repeated reads averaged at each point (full dwell each — total time per point ≈ samples × dwell). Populates std/min/max in the CSV.">Samples/pt</span></label><input type="number" id="in-samples" step="1" min="1" value="5"></div>
+      <div class="f span4" style="align-self:end">
+        <label class="chk"><input type="checkbox" id="in-reject-outliers" checked><span class="hint" title="Discard reads >3σ from the point's mean before averaging (cosmic-ray hits, stage glitches)">Reject outliers (3σ)</span></label>
+      </div>
+      <div class="f span12" style="align-self:end">
         <div class="opts">
           <label class="chk"><input type="checkbox" id="in-bidir"> Bidirectional</label>
           <label class="chk"><input type="checkbox" id="in-repeat"> Repeat</label>
@@ -112,13 +119,14 @@ details.card .h{flex:1;margin:0}
         <span id="ready-chip" class="chip" style="display:none">not ready</span>
         <button class="btn btn-sec btn-sm" id="btn-prepare" style="display:none">Prepare</button>
         <span style="flex:1"></span>
-        <a class="btn btn-sec btn-sm" id="btn-dl" href="/api/scan/download">Signal CSV</a>
-        <a class="btn btn-sec btn-sm hidden" id="btn-dl-spectra" href="/api/scan/spectra">Spectra CSV</a>
-        <button class="btn btn-sec btn-sm" id="btn-plot"
-                title="Matplotlib figure of the current plot, including any computed overlays">Plot PNG</button>
-        <button class="btn btn-sec btn-sm hidden" id="btn-plot-spectra"
-                title="Wavelength × position intensity map of the captured spectra">Spectra map PNG</button>
+        <button class="btn btn-sec btn-sm" id="btn-export">Download ZIP</button>
         <button class="btn btn-sec btn-sm" id="btn-clear">Clear</button>
+      </div>
+      <div class="span12 actions" id="export-opts" style="gap:16px;flex-wrap:wrap;padding-top:0">
+        <span class="muted" style="font-size:11px">scan_plot.png contents:</span>
+        <label class="chk"><input type="checkbox" id="in-exp-profile" checked>Beam profile fit</label>
+        <label class="chk"><input type="checkbox" id="in-exp-vsl" checked>VSL SSG fit</label>
+        <label class="chk"><input type="checkbox" id="in-exp-sat" checked>Saturation model</label>
       </div>
     </div>
   </div>
@@ -134,6 +142,7 @@ details.card .h{flex:1;margin:0}
         <label>Signal metric</label><div class="seg" id="metric-seg"></div>
       </div>
       <div class="f span3 hidden" id="wl-field"><label>Wavelength λ (nm)</label><input type="number" id="in-atwl" step="1" value="0"></div>
+      <div class="f span3 hidden" id="wlband-field"><label><span class="hint" title="0 = single nearest pixel. >0 sums counts over [λ − Δλ/2, λ + Δλ/2]">Band Δλ (nm)</span></label><input type="number" id="in-atwlband" step="0.5" min="0" value="0"></div>
       <div class="f span3 hidden" id="int-field"><label>Integration (ms)</label>
         <div class="inrow"><input type="number" id="in-int" step="1" min="0" value="10"><button class="btn btn-sec btn-sm" id="btn-int">Set</button></div></div>
       <div class="f span2 hidden" id="avg-field"><label>Averages</label>
@@ -184,12 +193,11 @@ details.card .h{flex:1;margin:0}
   <!-- ── Wavelength bands (spectrometer only) ────────────────────── -->
   <details class="card hidden" id="bands-card" open>
     <summary><span class="h">Wavelength bands</span>
-      <span class="muted hint" title="Integrated area ∫I·dλ within each band, computed from the full spectrum captured at every scan point">∫I·dλ</span></summary>
+      <span class="muted hint" title="Sum of pixel counts within each band, computed from the full spectrum captured at every scan point">Σ counts</span></summary>
     <div id="bands-list"></div>
     <div class="actions">
       <button class="btn btn-sec btn-sm" id="btn-band-add">+ Add band</button>
       <button class="btn btn-primary btn-sm" id="btn-band-compute">Compute &amp; overlay</button>
-      <button class="btn btn-sec btn-sm" id="btn-band-dl">Bands CSV</button>
     </div>
   </details>
 
@@ -199,7 +207,6 @@ details.card .h{flex:1;margin:0}
       <span class="muted hint" title="Differentiates a knife-edge scan (greatest rate of change = edge centre) and fits a Gaussian">knife-edge → Gaussian</span></summary>
     <div class="actions">
       <button class="btn btn-primary btn-sm" id="btn-profile">Compute &amp; overlay</button>
-      <a class="btn btn-sec btn-sm" id="btn-profile-dl" href="/api/scan/profile/download">Profile CSV</a>
       <button class="btn btn-sec btn-sm" id="btn-profile-clear">Clear</button>
     </div>
     <div id="profile-readout" class="muted">—</div>
@@ -218,18 +225,36 @@ details.card .h{flex:1;margin:0}
         <label class="chk"><input type="checkbox" id="in-vsl-live" checked>
           <span class="hint" title="Recompute and plot g_inst(z) from the growing dataset while the scan runs">Live instantaneous gain</span></label>
       </div>
+      <div class="f span5 hidden" id="vsl-spectral-field" style="align-self:end">
+        <label class="chk"><input type="checkbox" id="in-vsl-spectral" checked>
+          <span class="hint" title="Automatically find the changing emission band, subtract the short-stripe baseline, and fit the rising pre-saturation region">Spectrum-aware analysis</span></label>
+      </div>
+      <div class="f span4 hidden" id="vsl-band-field">
+        <label><span class="hint" title="Leave both fields blank to detect the changing emission feature automatically">Manual VSL band (nm)</span></label>
+        <div class="inrow"><input type="number" id="in-vsl-band-lo" step="0.1" placeholder="low">
+          <input type="number" id="in-vsl-band-hi" step="0.1" placeholder="high"></div>
+      </div>
     </div>
     <div class="actions">
       <button class="btn btn-primary btn-sm" id="btn-vsl">Compute gain</button>
-      <button class="btn btn-sec btn-sm" id="btn-vsl-dl">Gain CSV</button>
-      <button class="btn btn-sec btn-sm" id="btn-vsl-plot"
-              title="Matplotlib figure of the cutoff scan and instantaneous gain">Gain plot PNG</button>
       <button class="btn btn-sec btn-sm" id="btn-vsl-clear">Clear</button>
     </div>
     <div id="vsl-inst-readout" class="muted">g<sub>inst</sub>: —</div>
     <div id="vsl-readout" class="muted">—</div>
     <div id="vsl-plotwrap" style="position:relative;height:200px;display:none">
       <canvas id="vsl-plot" style="position:absolute;inset:0;width:100%;height:100%"></canvas>
+    </div>
+
+    <div class="divider"></div>
+    <div class="actions">
+      <label class="chk"><input type="checkbox" id="in-vsl-figlog">
+        <span class="hint" title="Symlog y-axis instead of linear — useful if gain crosses zero across a wide dynamic range">Log scale</span></label>
+      <button class="btn btn-sec btn-sm" id="btn-vsl-fig">Show plot</button>
+      <a id="lnk-vsl-fig-dl" class="btn btn-sec btn-sm hidden" download>Download PNG</a>
+      <span class="muted" style="font-size:11px">SSG &amp; Gsat cutoff-scan</span>
+    </div>
+    <div id="vsl-fig-wrap" class="hidden" style="margin-top:10px;background:#fff;border-radius:8px;padding:8px;border:1px solid var(--border)">
+      <img id="vsl-fig" style="width:100%;display:block;border-radius:4px">
     </div>
   </details>
 
@@ -316,11 +341,13 @@ function renderDetectors(list, activeId){
     const r=await post('/api/scan/detector',{id:b.dataset.id}); if(r.error){alertMsg(r.error);return;}
     DET_ID=null; pollConfig(); });
 }
-function renderDetector(act, metric, wavelength){
+function renderDetector(act, metric, wavelength, bandWidth){
   // act = active_detector block {id,name,kind,metrics,wavelength_range,acquisition}
   if(!act){ $('metric-row').style.display='none'; $('bands-card').classList.add('hidden');
     $('int-field').classList.add('hidden'); $('avg-field').classList.add('hidden');
-    $('wl-field').classList.add('hidden'); $('meterwl-field').classList.add('hidden'); return; }
+    $('wl-field').classList.add('hidden'); $('wlband-field').classList.add('hidden');
+    $('meterwl-field').classList.add('hidden');
+    $('dwell-auto-field').classList.add('hidden'); return; }
   DET_KIND=act.kind; METRICS=act.metrics||[]; WLRANGE=act.wavelength_range; METRIC=metric||(METRICS[0]&&METRICS[0].key);
   const spec = act.kind==='spectrometer';
   // metric seg
@@ -331,26 +358,51 @@ function renderDetector(act, metric, wavelength){
   $('int-field').classList.toggle('hidden',!spec);
   $('avg-field').classList.toggle('hidden',!spec);
   $('bands-card').classList.toggle('hidden',!spec);
-  $('btn-dl-spectra').classList.toggle('hidden',!spec);
-  $('btn-plot-spectra').classList.toggle('hidden',!spec);
+  $('vsl-spectral-field').classList.toggle('hidden',!spec);
+  $('vsl-band-field').classList.toggle('hidden',!spec);
+  $('dwell-auto-field').classList.toggle('hidden',!spec);
   if(spec && act.acquisition){ if(act.acquisition.integration_ms!=null)$('in-int').value=act.acquisition.integration_ms;
     if(act.acquisition.averages!=null)$('in-avg').value=act.acquisition.averages; }
   // power meter wavelength-correction field
   $('meterwl-field').classList.toggle('hidden',act.kind!=='power');
   // @λ field
   if(wavelength!=null && +$('in-atwl').value===0) $('in-atwl').value=wavelength;
+  if(bandWidth!=null) $('in-atwlband').value=bandWidth;
   updateMetricFields();
+  applyAutoDwell();
 }
+
+// ── dwell time auto-set from Integration × Averages (spectrometer only) ───
+// A full averaged spectrum takes ~integration_ms × averages to acquire; add
+// 15% margin for per-frame USB transfer/dark-read overhead so a scan point
+// doesn't need the collect_metric() fallback poll to catch a late frame.
+function autoDwellSeconds(){
+  const intMs=+$('in-int').value||0, avg=Math.max(1,+$('in-avg').value||1);
+  return Math.max(0.1, Math.ceil((intMs*avg/1000)*1.15*10)/10);
+}
+function applyAutoDwell(){
+  if(DET_KIND!=='spectrometer' || !$('in-dwell-auto').checked) return;
+  $('in-dwell').value=autoDwellSeconds();
+}
+$('in-int').oninput=applyAutoDwell;
+$('in-avg').oninput=applyAutoDwell;
+$('in-dwell-auto').onchange=applyAutoDwell;
+// Manually editing dwell while auto is on means the user wants a specific
+// value — stop overwriting it until they opt back in or the fields change.
+$('in-dwell').oninput=()=>{ if(DET_KIND==='spectrometer') $('in-dwell-auto').checked=false; };
 function updateMetricFields(){
-  $('wl-field').classList.toggle('hidden', !(DET_KIND==='spectrometer' && METRIC==='at_wavelength'));
+  const on = DET_KIND==='spectrometer' && METRIC==='at_wavelength';
+  $('wl-field').classList.toggle('hidden', !on);
+  $('wlband-field').classList.toggle('hidden', !on);
 }
 async function setMetric(key){
   METRIC=key;
   $('metric-seg').querySelectorAll('button').forEach(b=>b.classList.toggle('on',b.dataset.m===key));
   updateMetricFields();
-  await post('/api/scan/detector/metric',{metric:key,wavelength:+$('in-atwl').value||null});
+  await post('/api/scan/detector/metric',{metric:key,wavelength:+$('in-atwl').value||null,band_width:+$('in-atwlband').value||0});
 }
-$('in-atwl').onchange=()=>post('/api/scan/detector/metric',{metric:METRIC,wavelength:+$('in-atwl').value});
+$('in-atwl').onchange=()=>post('/api/scan/detector/metric',{metric:METRIC,wavelength:+$('in-atwl').value,band_width:+$('in-atwlband').value||0});
+$('in-atwlband').onchange=()=>post('/api/scan/detector/metric',{metric:METRIC,wavelength:+$('in-atwl').value,band_width:+$('in-atwlband').value||0});
 $('btn-int').onclick=()=>post('/api/scan/detector/acquire',{integration_ms:+$('in-int').value}).then(r=>r.error?alertMsg(r.error):alertMsg('Integration set','ok'));
 $('btn-avg').onclick=()=>post('/api/scan/detector/acquire',{averages:+$('in-avg').value}).then(r=>r.error?alertMsg(r.error):alertMsg('Averages set','ok'));
 $('in-meterwl').onchange=()=>{const nm=+$('in-meterwl').value;if(nm>0)post('/api/power/wavelength',{wavelength:nm});};
@@ -400,7 +452,11 @@ $('smc-btn-jog-pos').onclick=()=>smcAct('/api/smc/move/relative',{delta:+Math.ab
 $('smc-in-abs').onkeydown=e=>{ if(e.key==='Enter')$('smc-btn-abs').click(); };
 $('smc-btn-vel').onclick=()=>smcAct('/api/smc/velocity',{velocity:+$('smc-in-vel').value})
   .then(r=>r&&alertMsg('Velocity set to '+r.velocity+' mm/s','ok'));
-$('smc-btn-home').onclick=()=>smcAct('/api/smc/home').then(r=>r&&alertMsg(r.message||'Homing…','ok'));
+$('smc-btn-home').onclick=async()=>{
+  $('smc-btn-home').disabled=true;
+  try{ const r=await smcAct('/api/smc/home'); if(r)alertMsg(r.message||'Homing…','ok'); }
+  finally{ pollSmc(); }
+};
 $('smc-btn-stop').onclick=()=>post('/api/smc/stop',{});
 
 // ── readiness chip ────────────────────────────────────────────────
@@ -420,24 +476,41 @@ $('btn-start').onclick=async()=>{
   const r=await post('/api/scan/start',{ axis:AXIS,
     start:+$('in-start').value, stop:+$('in-stop').value, step_size:+$('in-step').value,
     settle_s:+$('in-settle').value, dwell_s:+$('in-dwell').value,
+    samples_per_point:+$('in-samples').value||1,
+    reject_outliers:$('in-reject-outliers').checked,
     bidirectional:$('in-bidir').checked, repeat:$('in-repeat').checked });
   if(r.error){alertMsg(r.error);return;}
   BAND_RESULT=null; alertMsg('Scan started — '+r.total+' points.','ok');
 };
 $('btn-stop').onclick=()=>post('/api/scan/stop',{});
-$('btn-clear').onclick=()=>{POINTS=[];BAND_RESULT=null;PROFILE=null;$('profile-readout').textContent='—';drawPlot();$('tbody').innerHTML='';$('tbl-n').textContent='0 points';$('prog-count').textContent='0 / 0';};
+$('btn-clear').onclick=async()=>{
+  clearAlert();
+  const r=await post('/api/scan/clear',{});
+  if(r.error){alertMsg(r.error);return;}
+  POINTS=[];BAND_RESULT=null;PROFILE=null;$('profile-readout').textContent='—';
+  drawPlot();$('tbody').innerHTML='';$('tbl-n').textContent='0 points';$('prog-count').textContent='0 / 0';
+};
 
 // ── matplotlib figure export ──────────────────────────────────────
 async function dlPlot(url){
   clearAlert();
-  const r=await fetch(url);
-  if(!r.ok){ let e=null; try{ e=(await r.json()).error; }catch(_){}
-    alertMsg(e||'Plot export failed'); return; }
-  // honour the server's filename if present
-  const cd=r.headers.get('Content-Disposition')||'';
-  const m=cd.match(/filename=([^;]+)/);
-  const blob=await r.blob(), u=URL.createObjectURL(blob), a=document.createElement('a');
-  a.href=u; a.download=m?m[1].trim():'plot.png'; a.click(); URL.revokeObjectURL(u);
+    const r = await fetch(url);
+    if (!r.ok) { 
+      let e = null; 
+      try { 
+        e = (await r.json()).error; 
+      } catch (_) {}
+      alertMsg(e || 'Plot export failed'); 
+      return; 
+    }
+    // honour the server's filename if present
+    const cd = r.headers.get('Content-Disposition') || '';
+    const m = cd.match(/filename=([^;]+)/);
+    const blob = await r.blob(), u = URL.createObjectURL(blob), a = document.createElement('a');
+    a.href = u; 
+    a.download = m ? m[1].trim() : 'plot.png'; 
+    a.click(); 
+    URL.revokeObjectURL(u);
 }
 function scanPlotURL(){
   // mirror whatever overlays are currently computed on the web plot
@@ -448,11 +521,6 @@ function scanPlotURL(){
   if(VSL_RESULT){ q.push('vsl=1'); const z0=vslZ0(); if(z0!==null)q.push('z0='+z0); }
   return '/api/scan/plot'+(q.length?'?'+q.join('&'):'');
 }
-$('btn-plot').onclick=()=>dlPlot(scanPlotURL());
-$('btn-plot-spectra').onclick=()=>dlPlot('/api/scan/spectra/plot');
-$('btn-vsl-plot').onclick=()=>{ const z0=vslZ0();
-  dlPlot('/api/scan/vsl/plot'+(z0!==null?'?z0='+z0:'')); };
-
 // ── band post-processing ──────────────────────────────────────────
 let BANDS=[{lo:'',hi:''}], BAND_RESULT=null;
 function renderBands(){
@@ -471,6 +539,19 @@ function renderBands(){
 function lastVal(arr){ for(let i=arr.length-1;i>=0;i--) if(arr[i]!=null) return arr[i]; return null; }
 $('btn-band-add').onclick=()=>{ BANDS.push({lo:'',hi:''}); renderBands(); };
 function bandPayload(){ return BANDS.filter(b=>b.lo!==''&&b.hi!=='').map(b=>[+b.lo,+b.hi]); }
+function updateExpOpts(){ $('in-exp-sat').disabled=!$('in-exp-vsl').checked; }
+$('in-exp-vsl').onchange=updateExpOpts; updateExpOpts();
+$('btn-export').onclick=async()=>{
+  clearAlert();
+  const plot={profile:$('in-exp-profile').checked, vsl:$('in-exp-vsl').checked,
+              sat:$('in-exp-vsl').checked&&$('in-exp-sat').checked};
+  const resp=await postBlob('/api/scan/export',{bands:bandPayload(),z0:vslZ0(),plot});
+  if(!resp.ok){ let e=null; try{ e=(await resp.json()).error; }catch(_){}
+    alertMsg(e||'Export failed'); return; }
+  const cd=resp.headers.get('Content-Disposition')||'', m=cd.match(/filename=([^;]+)/);
+  const blob=await resp.blob(), url=URL.createObjectURL(blob), a=document.createElement('a');
+  a.href=url; a.download=m?m[1].trim():'scan_export.zip'; a.click(); URL.revokeObjectURL(url);
+};
 $('btn-band-compute').onclick=async()=>{
   clearAlert(); const bands=bandPayload();
   if(!bands.length){alertMsg('Add at least one band (λ low / λ high).');return;}
@@ -479,14 +560,6 @@ $('btn-band-compute').onclick=async()=>{
   BAND_RESULT=r; renderBands(); drawPlot();
   alertMsg('Computed '+r.bands.length+' band(s).','ok');
 };
-$('btn-band-dl').onclick=async()=>{
-  const bands=bandPayload(); if(!bands.length){alertMsg('Add at least one band.');return;}
-  const resp=await postBlob('/api/scan/bands/download',{bands});
-  if(!resp.ok){alertMsg('No spectra captured yet.');return;}
-  const blob=await resp.blob(), url=URL.createObjectURL(blob), a=document.createElement('a');
-  a.href=url; a.download='bands.csv'; a.click(); URL.revokeObjectURL(url);
-};
-
 // ── knife-edge beam profile ───────────────────────────────────────
 let PROFILE=null;
 $('btn-profile').onclick=async()=>{
@@ -523,7 +596,7 @@ async function pollConfig(){
     if(!c.active){ ACT_ID=null; $('axis-seg').innerHTML='<button disabled>no actuator connected</button>'; }
     renderDetectors(c.detectors||[], c.active_detector?c.active_detector.id:null);
     const ad=c.active_detector;
-    if(ad && ad.id!==DET_ID){ DET_ID=ad.id; renderDetector(ad, c.metric, c.wavelength); }
+    if(ad && ad.id!==DET_ID){ DET_ID=ad.id; renderDetector(ad, c.metric, c.wavelength, c.band_width); }
     else if(ad){ DET_KIND=ad.kind; }   // keep current
     if(!ad){ DET_ID=null; renderDetector(null); }
     if(c.power && c.power.wavelength && +$('in-meterwl').value===0) $('in-meterwl').value=c.power.wavelength;
@@ -667,10 +740,42 @@ const vcv=$('vsl-plot'), vctx=vcv?vcv.getContext('2d'):null;
 
 function vslZ0(){const v=+$('in-vsl-z0').value; return ($('in-vsl-z0').value===''||isNaN(v))?null:v;}
 
+// ── publication-style VSL gain figure (matplotlib, rendered server-side) ──
+let VSL_FIG_URL=null;
+function vslFigureURL(){
+  const q=[];
+  const z0=vslZ0(); if(z0!==null) q.push('z0='+z0);
+  if($('in-vsl-figlog').checked) q.push('log=1');
+  return '/api/scan/vsl/plot'+(q.length?'?'+q.join('&'):'');
+}
+async function loadVslFigure(){
+  clearAlert();
+  const r=await fetch(vslFigureURL());
+  if(!r.ok){ let e=null; try{ e=(await r.json()).error; }catch(_){}
+    alertMsg(e||'Plot render failed'); return; }
+  const cd=r.headers.get('Content-Disposition')||'', m=cd.match(/filename=([^;]+)/);
+  const blob=await r.blob(), objUrl=URL.createObjectURL(blob);
+  if(VSL_FIG_URL) URL.revokeObjectURL(VSL_FIG_URL);
+  VSL_FIG_URL=objUrl;
+  $('vsl-fig').src=objUrl;
+  $('vsl-fig-wrap').classList.remove('hidden');
+  const dl=$('lnk-vsl-fig-dl');
+  dl.href=objUrl; dl.download=m?m[1].trim():'vsl_gain_plot.png';
+  dl.classList.remove('hidden');
+}
+$('btn-vsl-fig').onclick=loadVslFigure;
+$('in-vsl-figlog').onchange=()=>{ if(!$('vsl-fig-wrap').classList.contains('hidden')) loadVslFigure(); };
+
 // Live instantaneous gain g_inst(z) = (dI/dz − A_sp)/I(z) — refreshed while
 // the scan acquires (De Giorgi & Anni VSL method).
+// The spectral checkbox only applies when its field is visible (spectrometer
+// detector) — it stays checked while hidden, and must not suppress live gain
+// for power-meter scans.
+function spectralModeOn(){
+  return !$('vsl-spectral-field').classList.contains('hidden') && $('in-vsl-spectral').checked;
+}
 async function pollInstant(){
-  if(!$('in-vsl-live').checked || POINTS.length<5) return;
+  if(!$('in-vsl-live').checked || spectralModeOn() || POINTS.length<5) return;
   if(POINTS.length===INST_N && !(VSL_RESULT===null&&INST_RESULT===null)) return;  // nothing new
   INST_N=POINTS.length;
   const z0=vslZ0();
@@ -692,9 +797,30 @@ setInterval(pollInstant, 1200);
 $('btn-vsl').onclick=async()=>{
   clearAlert();
   const z0=vslZ0();
-  const url='/api/scan/vsl'+(z0!==null?'?z0='+z0:'');
-  const r=await fetch(url).then(x=>x.json());
+  const loText=$('in-vsl-band-lo').value.trim(), hiText=$('in-vsl-band-hi').value.trim();
+  if((loText===''&&hiText!=='')||(loText!==''&&hiText==='')){
+    alertMsg('Enter both manual VSL band limits, or leave both blank for automatic selection.'); return;
+  }
+  const band=loText===''?null:[+loText,+hiText];
+  if(band&&(!isFinite(band[0])||!isFinite(band[1]))){ alertMsg('Manual VSL band limits must be numbers.'); return; }
+  const r=await post('/api/scan/vsl',{z0, spectral_auto:spectralModeOn(), band});
   if(r.error){alertMsg(r.error);return;}
+  if(r.mode==='spectral_auto'){
+    VSL_RESULT=null; INST_RESULT=null; INST_N=0;
+    const xu=r.x_unit||'', band=r.band, fit=r.fit_range;
+    const cmNote=(xu==='mm')?' &nbsp;·&nbsp; <span class="muted">×10 → '+(r.best_g*10).toFixed(2)+' cm⁻¹</span>':'';
+    let html='<b style="color:var(--accent)">spectrum-aware g</b> = <b>'+r.best_g.toFixed(5)+'</b> 1/'+xu+
+      ' &nbsp; ±'+r.best_ci95.toFixed(5)+' (95% CI)'+cmNote+
+      '<br><span class="muted">'+band.lo.toFixed(1)+'–'+band.hi.toFixed(1)+' nm ('+band.source+'); '+
+      'baseline '+fmtSignal(r.baseline,'counts','counts')+' from '+r.baseline_points+' short-stripe points; '+
+      'fit '+fit.lo.toFixed(3)+'–'+fit.hi.toFixed(3)+' '+xu+' (R²='+r.r2.toFixed(3)+').</span>';
+    if(r.warnings.length) html+='<br><span style="color:var(--orange)">'+r.warnings.join(' ')+'</span>';
+    $('vsl-readout').innerHTML=html;
+    $('vsl-inst-readout').innerHTML='Spectrum-aware fit uses the captured spectra; live raw-signal gain is paused.';
+    $('vsl-plotwrap').style.display='none'; drawPlot();
+    alertMsg('Spectrum-aware candidate gain: '+r.best_g.toFixed(4)+' 1/'+xu,'ok');
+    return;
+  }
   VSL_RESULT=r;
   if(r.inst){ INST_RESULT={...r.inst, x_unit:r.x_unit};
     $('vsl-inst-readout').innerHTML=
@@ -719,23 +845,18 @@ $('btn-vsl').onclick=async()=>{
   $('vsl-plotwrap').style.display='';
   requestAnimationFrame(()=>requestAnimationFrame(drawVslPlot));
   drawPlot();
+  loadVslFigure();
   alertMsg('VSL gain g = '+g.toFixed(5)+' 1/'+xu+' ±'+ci.toFixed(5),'ok');
 };
 
 $('btn-vsl-clear').onclick=()=>{
   VSL_RESULT=null; INST_RESULT=null; INST_N=0;
+  if(VSL_FIG_URL){ URL.revokeObjectURL(VSL_FIG_URL); VSL_FIG_URL=null; }
+  $('vsl-fig-wrap').classList.add('hidden');
+  $('lnk-vsl-fig-dl').classList.add('hidden');
   $('vsl-readout').textContent='—';
   $('vsl-inst-readout').innerHTML='g<sub>inst</sub>: —';
   $('vsl-plotwrap').style.display='none'; drawPlot();
-};
-
-$('btn-vsl-dl').onclick=async()=>{
-  const z0=vslZ0();
-  const url='/api/scan/vsl/download'+(z0!==null?'?z0='+z0:'');
-  const resp=await fetch(url);
-  if(!resp.ok){alertMsg('Run VSL gain analysis first.');return;}
-  const blob=await resp.blob(),burl=URL.createObjectURL(blob),a=document.createElement('a');
-  a.href=burl; a.download='vsl_gain.csv'; a.click(); URL.revokeObjectURL(burl);
 };
 
 function drawVslPlot(){

@@ -6,6 +6,7 @@
 <title>HR4000 — VSL Scan</title>
 <link rel="stylesheet" href="/static/style.css">
 <script src="/static/theme.js"></script>
+<script src="/static/standalone-nav.js" defer></script>
 <style>
 body{display:flex;flex-direction:column;align-items:center}
 main{width:100%;max-width:1080px;padding:20px 24px 60px}
@@ -31,6 +32,8 @@ canvas{position:absolute;inset:0;width:100%;height:100%}
 <body>
 
 <header class="app-header">
+  <img src="/static/United_States_Army_Space_and_Missile_Defense_Command_Logo.svg"
+       alt="United States Army Space and Missile Defense Command" class="brand-logo">
   <span class="wordmark">HR4000CG-UV-NIR<small>Ocean Optics · 200–1100 nm</small></span>
   <nav class="app-nav">
     <a href="/">Scan</a>
@@ -82,9 +85,7 @@ canvas{position:absolute;inset:0;width:100%;height:100%}
       </div>
 
       <div class="span12 actions">
-        <a class="btn btn-primary btn-sm" id="btn-save" href="/api/spec/save">Save spectrum CSV</a>
-        <a class="btn btn-sec btn-sm" id="btn-plot" href="/api/spec/plot"
-           title="Matplotlib figure of the current spectrum">Save plot PNG</a>
+        <a class="btn btn-primary btn-sm" href="/api/spec/export">Download ZIP</a>
         <button class="btn btn-sec btn-sm" id="btn-reconnect">Reconnect</button>
         <span style="flex:1"></span>
         <span class="muted" id="info-line"></span>
@@ -124,7 +125,7 @@ $('btn-avg').onclick=()=>act('/api/spec/averaging',{scans:+$('in-avg').value},'A
 $('btn-box').onclick=()=>act('/api/spec/boxcar',{width:+$('in-box').value},'Boxcar set');
 $('in-dark').onchange=()=>act('/api/spec/dark',{enable:$('in-dark').checked});
 $('in-hold').onchange=()=>{ YMAX_HOLD=0; };
-$('in-log').onchange=()=>{ $('btn-plot').href='/api/spec/plot'+($('in-log').checked?'?log=1':''); drawPlot(); };
+$('in-log').onchange=()=>{ drawPlot(); };
 $('btn-reconnect').onclick=async()=>{ const r=await post('/api/spec/reconnect'); loadInfo(); alertMsg(r.connected?'Reconnected.':(r.error||'Failed'),r.connected?'ok':'err'); };
 
 // ── live spectrum poll ────────────────────────────────────────────
